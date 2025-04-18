@@ -5,18 +5,18 @@ import com.fazecast.jSerialComm.SerialPortDataListener;
 import com.fazecast.jSerialComm.SerialPortEvent;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.OutputStream;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
 
 public class SerialCommunicator implements SerialPortDataListener {
-    // Lista na zwalidowane, czyste dane payloadu
-    private final List<Byte> validatedMessageData = Collections.synchronizedList(new ArrayList<>());
+
+    private Xmodem xmodem = null; // Obiekt, który przetwarza dane
+
+    // Metoda do ustawienia xmodem
+    public void setXmodem(Xmodem handler) {
+        this.xmodem = handler;
+    }
 
     private SerialPort chosenPort = null;
-    private boolean isTransfer = false;
 
     public void listPorts() {
         SerialPort[] ports = SerialPort.getCommPorts();
@@ -71,37 +71,6 @@ public class SerialCommunicator implements SerialPortDataListener {
         }
     }
 
-    public void receiveData() {
-
-        if (chosenPort != null && chosenPort.isOpen()) {
-            try {
-                InputStream in = chosenPort.getInputStream();
-                byte[] readBuffer = new byte[132]; // Bufor na dane
-                byte firstByte = (byte) in.read(); // Czyta pierwszy bajt
-
-                if (Xmodem.checkHeader(firstByte) == 0) {
-                    sendData(new byte[] {(byte) 0x06});
-                    return;
-                }
-                else if(Xmodem.checkHeader(firstByte) == -1){
-                    return;
-                }
-
-                int numRead = in.read(readBuffer); // Liczba odczytanych bajtów
-
-                if (numRead == Xmodem.checkHeader(firstByte)) {
-
-                } else {
-                    System.out.println("Nie odebrano danych w zadanym czasie.");
-                }
-            } catch (IOException e) {
-                System.err.println("Błąd podczas odbierania danych: " + e.getMessage());
-            }
-        } else {
-            System.err.println("Port nie jest otwarty.");
-        }
-    }
-
     public void startListening() {
         if (chosenPort != null && chosenPort.isOpen()) {
             // Usuń poprzedniego listenera, jeśli istniał
@@ -130,17 +99,28 @@ public class SerialCommunicator implements SerialPortDataListener {
 
     // jSerialComm automatycznie wywołuje metodę gdy Listener wykryje zdarzenie
     @Override
-    public void serialEvent(SerialPortEvent serialPortEvent) {
-        if (serialPortEvent.getEventType() != SerialPort.LISTENING_EVENT_DATA_AVAILABLE) {
-            return; // Ignoruj inne typy zdarzeń
+    public void serialEvent(SerialPortEvent event) {
+        if (event.getEventType() != SerialPort.LISTENING_EVENT_DATA_AVAILABLE) {
+            return;
         }
 
-        System.out.println("Odebrano dane!");
-        receiveData();
-        isTransfer = true;
-    }
+        // Bajty czekające na odczytanie
+        int bytesAvailable = chosenPort.bytesAvailable();
+        if (bytesAvailable <= 0) {
+            return;
+        }
 
-    public boolean isTransfer() {
-        return isTransfer;
+        byte[] readData = new byte[bytesAvailable];
+        int numRead = chosenPort.readBytes(readData, readData.length);
+
+        if (numRead > 0) {
+            //Przekaż dane do xmodem, on jest odpowiedzialny za ich przetwarzanie
+            if (xmodem != null) {
+                System.out.println("Listener: Odebrano " + numRead + " bajtów. Przekazuję do xmodem.");
+                xmodem.ReceivedDataFromSerial(readData);
+            } else {
+                System.out.println("Listener: Odebrano dane, ale brak xmodem");
+            }
+        }
     }
 }
