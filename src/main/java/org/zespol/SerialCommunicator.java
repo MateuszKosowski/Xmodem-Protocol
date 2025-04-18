@@ -79,7 +79,7 @@ public class SerialCommunicator implements SerialPortDataListener {
             chosenPort.addDataListener(this);
             System.out.println("Rozpoczęto nasłuchiwanie na porcie " + chosenPort.getSystemPortName());
         } else {
-            System.err.println("Port nie jest otwarty, nie można rozpocząć nasłuchiwania.");
+            System.out.println("Port nie jest otwarty, nie można rozpocząć nasłuchiwania.");
         }
     }
 
