@@ -7,9 +7,16 @@ import com.fazecast.jSerialComm.SerialPortEvent;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 
 public class SerialCommunicator implements SerialPortDataListener {
+    // Lista na zwalidowane, czyste dane payloadu
+    private final List<Byte> validatedMessageData = Collections.synchronizedList(new ArrayList<>());
+
     private SerialPort chosenPort = null;
+    private boolean isTransfer = false;
 
     public void listPorts() {
         SerialPort[] ports = SerialPort.getCommPorts();
@@ -30,7 +37,7 @@ public class SerialCommunicator implements SerialPortDataListener {
 
         if (chosenPort.openPort()) {
             // Config
-            chosenPort.setComPortParameters(9600, 1024, SerialPort.ONE_STOP_BIT, SerialPort.NO_PARITY);
+            chosenPort.setComPortParameters(9600, 8, SerialPort.ONE_STOP_BIT, SerialPort.NO_PARITY);
             chosenPort.setComPortTimeouts(SerialPort.TIMEOUT_READ_BLOCKING, 100, 0);
 
             System.out.println("Port skonfigurowany: 9600 baud, 8 bitów danych, 1 bit stopu, brak parzystości, timeout odczytu 100ms.");
@@ -49,11 +56,11 @@ public class SerialCommunicator implements SerialPortDataListener {
         }
     }
 
-    public void sendData(String message) {
+    public void sendData(byte[] message) {
         if (chosenPort != null && chosenPort.isOpen()) {
             try {
                 OutputStream out = chosenPort.getOutputStream();
-                out.write(message.getBytes());
+                out.write(message);
                 out.flush(); // Opcjonalnie, jeśli chcesz wymusić wysłanie
                 System.out.println("Wysłano: " + message);
             } catch (IOException e) {
@@ -64,16 +71,26 @@ public class SerialCommunicator implements SerialPortDataListener {
         }
     }
 
-    public String receiveData() {
+    public void receiveData() {
+
         if (chosenPort != null && chosenPort.isOpen()) {
             try {
                 InputStream in = chosenPort.getInputStream();
-                byte[] readBuffer = new byte[1024]; // Bufo na dane
+                byte[] readBuffer = new byte[132]; // Bufor na dane
+                byte firstByte = (byte) in.read(); // Czyta pierwszy bajt
+
+                if (Xmodem.checkHeader(firstByte) == 0) {
+                    sendData(new byte[] {(byte) 0x06});
+                    return;
+                }
+                else if(Xmodem.checkHeader(firstByte) == -1){
+                    return;
+                }
+
                 int numRead = in.read(readBuffer); // Liczba odczytanych bajtów
-                if (numRead > 0) {
-                    String received = new String(readBuffer, 0, numRead);
-                    System.out.println("Odebrano: " + received);
-                    return received;
+
+                if (numRead == Xmodem.checkHeader(firstByte)) {
+
                 } else {
                     System.out.println("Nie odebrano danych w zadanym czasie.");
                 }
@@ -83,7 +100,6 @@ public class SerialCommunicator implements SerialPortDataListener {
         } else {
             System.err.println("Port nie jest otwarty.");
         }
-        return null;
     }
 
     public void startListening() {
@@ -121,5 +137,10 @@ public class SerialCommunicator implements SerialPortDataListener {
 
         System.out.println("Odebrano dane!");
         receiveData();
+        isTransfer = true;
+    }
+
+    public boolean isTransfer() {
+        return isTransfer;
     }
 }
