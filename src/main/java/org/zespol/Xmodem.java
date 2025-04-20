@@ -9,6 +9,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 public class Xmodem {
+
     private static final int SOH = 0x01;    // Start of Header - znak rozpoczynający pakiet danych
     private static final int EOT = 0x04;    // End of Transmission - znak oznaczający koniec transmisji
     private static final int ACK = 0x06;    // Acknowledge - potwierdzenie prawidłowego odbioru pakietu
@@ -148,8 +149,6 @@ public class Xmodem {
     private void processInternalBuffer() {
 
         boolean processedSomething = true;
-        cancelNakTask();
-
 
         while (processedSomething && !buffer.isEmpty() && (currentState == TransferState.EXPECTING_SOH || currentState == TransferState.RECEIVING))
         {
@@ -158,17 +157,6 @@ public class Xmodem {
             System.out.println("XMODEM: Przetwarzanie bufora, pierwszy bajt: 0x" + String.format("%02X", firstByte));
 
             if (firstByte == SOH) {
-
-                // Sprawdź, czy jest wystarczająco danych na blok (>= FULL_BLOCK_SIZE)
-                // Jeśli tak:
-                //    - Skopiuj blok
-                //    - Wywołaj processXmodemBlock(skopiowany_blok)
-                //    - Usuń 132 bajty z internalBuffer
-                //    - Ustaw processedSomething = true;
-                // Jeśli nie:
-                //    - Ustaw processedSomething = false; // Czekaj na więcej danych
-                //    - break; // Wyjdź z pętli while
-
                 if (buffer.size() >= 132) {
                     byte[] temp = new byte[132];
                     System.arraycopy(buffer.toArray(), 0, temp, 0, 132);
@@ -180,19 +168,24 @@ public class Xmodem {
                 }
                 // TODO: NA PÓŹNIEJ
             } else if (firstByte == EOT && currentState == TransferState.RECEIVING) {
-                // Wywołaj completeTransfer()
-                // Usuń EOT z internalBuffer
-                // Ustaw processedSomething = true;
-                // break;
+                completeTransfer();
+                buffer.removeFirst();
+                processedSomething = true;
+                break;
             } else if (firstByte == CAN) {
-                // Wywołaj abortTransfer(true)
-                // Usuń CAN (i drugi CAN) z internalBuffer
-                // Ustaw processedSomething = true;
-                // break;
+                abortTransfer(true);
+                if (buffer.size() >= 2) {
+                    buffer.removeFirst(); // Usuń pierwszy CAN
+                    buffer.removeFirst(); // Usuń drugi CAN
+                } else {
+                    buffer.clear(); // Wyczyść bufor, jeśli nie ma wystarczającej ilości danych
+                }
+                processedSomething = true;
+                break;
             } else {
                 // Nieznany/nieoczekiwany bajt
                 System.err.println("   -> Nieoczekiwany bajt: 0x" + String.format("%02X", firstByte) + ". Odrzucanie.");
-                buffer.remove(0); // Usuń go
+                buffer.removeFirst(); // Usuń go
                 processedSomething = true; // Coś usunęliśmy
             }
 
@@ -213,7 +206,14 @@ public class Xmodem {
                     // TODO: Zapisać payload do pliku
 
                     communicator.sendData(new byte[]{ACK});
+                    nakRetries = 0;
+                    if(currentState == TransferState.EXPECTING_SOH) {
+                        cancelNakTask();
+                    }
                     expectedBlockNumber++;
+                    if (expectedBlockNumber == 256){
+                        expectedBlockNumber = 0;
+                    }
                     currentState = TransferState.RECEIVING;
                 } else {
                     // Suma kontrolna się nie zgadza
@@ -234,38 +234,35 @@ public class Xmodem {
         else{
             System.out.println("Błedny blok danych, przerywam działanie!");
             abortTransfer(false);
-            return;
         }
     }
 
 
-    // METODA OBSŁUGI BŁĘDÓW BLOKU (Szkielet)
+    // Obsługa błędu bloku
     private void handleBlockError() {
         System.out.println("XMODEM: Obsługa błędu bloku...");
-        // --- TU BĘDZIE LOGIKA WYSYŁANIA NAK I SPRAWDZANIA LIMITU PRÓB ---
-        // (Implementacja w następnym kroku)
-        // - Zwiększ nakRetries
-        // - Jeśli nakRetries > MAX_NAK_RETRIES: abortTransfer(false)
-        // - W przeciwnym razie: communicator.sendData(new byte[]{NAK})
+        nakRetries++;
+        if (nakRetries > maxNak) {
+            abortTransfer(false);
+        } else {
+            communicator.sendData(new byte[]{NAK});
+        }
     }
 
-    // METODA ZAKOŃCZENIA TRANSFERU (Szkielet)
+    // METODA ZAKOŃCZENIA TRANSFERU
     private void completeTransfer() {
         System.out.println("XMODEM: Finalizowanie transferu...");
-        // --- TU BĘDZIE LOGIKA ZAKOŃCZENIA ---
-        // (Implementacja w następnym kroku)
-        // - Ustaw currentState = TransferState.COMPLETED
-        // - Wywołaj closeFileStream()
-        // - Być może loguj podsumowanie (ile bloków, bajtów itp.)
+        currentState = TransferState.COMPLETED;
+        cancelNakTask(); // Zatrzymaj wysyłanie NAK
     }
 
-    // METODA ANULOWANIA TRANSFERU (Szkielet)
+    // METODA ANULOWANIA TRANSFERU
     private void abortTransfer(boolean receivedCan) {
         // Sprawdź, czy już nie jest anulowany, aby uniknąć podwójnego działania
         if (currentState == TransferState.ABORTED || currentState == TransferState.ERROR) {
             return;
         }
-        System.err.println("XMODEM: Anulowanie transferu. Otrzymano CAN: " + receivedCan);
+        System.out.println("XMODEM: Anulowanie transferu. Otrzymano CAN: " + receivedCan);
 
         // !!! ZATRZYMAJ TIMER NAK !!!
         cancelNakTask();
@@ -274,8 +271,6 @@ public class Xmodem {
             communicator.sendData(new byte[]{CAN, CAN});
         }
         currentState = TransferState.ABORTED;
-        // - Wywołaj closeFileStream()
-        // - Rozważ usunięcie pliku
     }
 
     private static byte calculateChecksum(byte[] data, int offset, int length) {
