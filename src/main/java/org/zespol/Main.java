@@ -11,6 +11,7 @@ public class Main {
         SerialCommunicator sc = new SerialCommunicator();
         Xmodem xmodem = new Xmodem(sc);
         sc.setXmodem(xmodem);
+        xmodem.setOutputFileName("./output.txt");
 
         sc.listPorts();
         String port = "COM10";
