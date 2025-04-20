@@ -1,5 +1,9 @@
 package org.zespol;
 
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -38,6 +42,34 @@ public class Xmodem {
     private final SerialCommunicator communicator;
     // Wewnętrzny bufor do przechowywania odebranych danych, jeszcze nieprzetworzonych
     private final List<Byte> buffer = new ArrayList<>();
+
+    private String outputFileName;
+
+    public void setOutputFileName(String fileName) {
+        this.outputFileName = fileName;
+        // Usunięcie pliku, jeśli już istnieje
+        try {
+            Files.deleteIfExists(Paths.get(fileName));
+        } catch (IOException e) {
+            System.err.println("XMODEM: Nie można usunąć istniejącego pliku: " + e.getMessage());
+        }
+    }
+
+    private void savePayloadToFile(byte[] payload) {
+        if (outputFileName == null || outputFileName.isEmpty()) {
+            System.err.println("XMODEM: Nazwa pliku docelowego nie została ustawiona!");
+            abortTransfer(false);
+            return;
+        }
+
+        try (FileOutputStream fileOutputStream = new FileOutputStream(outputFileName, true)) {
+            fileOutputStream.write(payload);
+            System.out.println("XMODEM: Zapisano " + payload.length + " bajtów do pliku " + outputFileName);
+        } catch (IOException e) {
+            System.err.println("XMODEM: Błąd podczas zapisu do pliku: " + e.getMessage());
+            abortTransfer(false);
+        }
+    }
 
     // Konstruktor
     public Xmodem(SerialCommunicator communicator) {
@@ -203,7 +235,7 @@ public class Xmodem {
                     System.out.println("  -> Blok " + expectedBlockNumber + " ODEBRANY POPRAWNIE.");
                     byte[] payload = Arrays.copyOfRange(blockData, 3, 131);
 
-                    // TODO: Zapisać payload do pliku
+                    savePayloadToFile(payload); // Zapisz do pliku
 
                     communicator.sendData(new byte[]{ACK});
                     nakRetries = 0;
