@@ -41,7 +41,7 @@ public class Main {
             // Jeśli portu nie udało się otworzyć, zakończ aplikację
             System.out.println("Nie udało się otworzyć portu " + selectedPort + ". Zamykanie aplikacji.");
             scanner.close();
-            xmodem.shutdownScheduler(); // Zamknij scheduler Xmodem, jeśli został uruchomiony (choć tu raczej nie zdążył)
+            xmodem.shutdownScheduler(); // Zamknij scheduler Xmodem, jeśli został uruchomiony
             return;
         }
 

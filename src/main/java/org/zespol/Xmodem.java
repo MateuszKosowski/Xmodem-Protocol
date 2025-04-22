@@ -63,7 +63,7 @@ public class Xmodem {
     }
 
     // --- Pola instancji klasy ---
-    private volatile TransferState currentState; // Bieżący stan automatu skończonego (volatile dla bezpieczeństwa wątkowego)
+    private volatile TransferState currentState; // Bieżący stan automatu skończonego (volatile dla bezpieczeństwa wątkowego - zapis odczyt zawsze do RAM a nie cache)
     private final SerialCommunicator communicator; // Obiekt odpowiedzialny za fizyczną komunikację przez port szeregowy
     private final List<Byte> receiveBuffer = new ArrayList<>(); // Bufor na dane odbierane z portu szeregowego, przetwarzane przez processInternalBuffer
     private String outputFileName; // Nazwa pliku, do którego zapisywane są odbierane dane (używane przez odbiornik)
@@ -75,7 +75,6 @@ public class Xmodem {
     private int receiveRetries = 0; // Licznik prób odbioru bieżącego bloku lub prób inicjalizacji (odbiornik)
     private int sendRetries = 0; // Licznik prób wysłania bieżącego bloku lub EOT, lub prób inicjalizacji (nadajnik)
 
-    // Executor do zarządzania zadaniami czasowymi (timeout)
     // Wątek do obsługi timeoutów
     private final ScheduledExecutorService timeoutScheduler = Executors.newSingleThreadScheduledExecutor();
     private ScheduledFuture<?> timeoutTaskHandler; // Uchwyt do aktywnego zadania obsługi timeoutu
@@ -209,12 +208,7 @@ public class Xmodem {
                 abortTransfer(false);
             }
         } else {
-            // Timeout w innym, nieoczekiwanym stanie - może oznaczać błąd wewnętrzny
-                 // Wysłanie NAK nie ma sensu, bo nie wiemy co poszło nie tak
-                 // Można by spróbować anulować i zacząć od nowa, albo po prostu anulować
             LOGGER.warning("Timeout wystąpił w nieoczekiwanym stanie odbiornika: " + currentState);
-            // Można rozważyć anulowanie transferu lub logowanie błędu
-             // abortTransfer(false);
         }
         // Timeouty w innych stanach (np. IDLE, COMPLETED) są ignorowane
     }
@@ -233,6 +227,8 @@ public class Xmodem {
 
         // Synchronizacja na buforze jest ważna, aby uniknąć ConcurrentModificationException,
         // gdy wątek listenera portu dodaje dane, a wątek przetwarzający (lub timeout) może je modyfikować.
+        // Nakładana jest blokada wyłączna na buforze.
+
         // Dodaj odebrane bajty do wewnętrznego bufora
         // Synchronizacja jest potrzebna, jeśli ta metoda może być wywołana z innego wątku niż processInternalBuffer
         synchronized (receiveBuffer) {
@@ -240,9 +236,6 @@ public class Xmodem {
                 receiveBuffer.add(b);
             }
         }
-            // Logowanie może być przydatne, ale generuje dużo danych
-        //LOGGER.finest("[Odbiornik] Dodano " + data.length + " bajtów do bufora. Rozmiar bufora: " + receiveBuffer.size());
-
 
         // Uruchom przetwarzanie danych w buforze
         processInternalBuffer();
@@ -256,12 +249,10 @@ public class Xmodem {
      * Metoda jest `synchronized`, aby zapobiec współbieżnemu dostępowi do bufora i stanu.
      */
     private synchronized void processInternalBuffer() {
-        //LOGGER.finest("Przetwarzanie bufora, stan: " + currentState + ", rozmiar bufora: " + receiveBuffer.size());
 
         while (!receiveBuffer.isEmpty()) {
             // Sprawdź pierwszy bajt w buforze bez usuwania go
             byte firstByte = receiveBuffer.getFirst();
-            // System.out.println("[Buffer Proc] Pierwszy bajt: " + String.format("0x%02X", firstByte) + " w stanie " + currentState);
 
             switch (currentState) {
                 case EXPECTING_SOH:
@@ -275,16 +266,13 @@ public class Xmodem {
                             if (block.length == requiredBlockLength) {
                                 cancelTimeoutTask(); // Odebraliśmy coś, anuluj timeout
                                 processXmodemBlock(block); // Przetwórz blok
-                                // processXmodemBlock ustawi odpowiedni stan i timeout
                             } else {
                                 LOGGER.warning("Błąd podczas wyciągania bloku SOH z bufora.");
-                                // Błąd wewnętrzny, może warto anulować?
                                 return; // Zakończ przetwarzanie na razie
                             }
                         } else {
                             // Za mało danych na pełny blok, czekaj na więcej
-                        // Wykryto SOH, ale dane są niekompletne, czekamy na resztę
-                            //LOGGER.finest("Oczekuje na SOH, za mało danych w buforze (" + receiveBuffer.size() + "/" + requiredBlockLength + ")");
+                            // Wykryto SOH, ale dane są niekompletne, czekamy na resztę
                             return; // Zakończ pętlę, poczekaj na więcej danych
                         }
                     } else if (firstByte == EOT) {
@@ -314,7 +302,6 @@ public class Xmodem {
                         byte unexpectedByte = extractBytesFromBuffer(1)[0];
                         LOGGER.warning("[Odbiornik] W stanie " + currentState + " odebrano nieoczekiwany bajt: " + String.format("0x%02X", unexpectedByte) + ". Ignorowanie.");
                         // Ignorujemy nieoczekiwane bajty, czekając na SOH lub EOT
-                        // Można by dodać licznik błędów i anulować po przekroczeniu limitu
                     }
                     break; // Koniec obsługi stanu EXPECTING_SOH
 
@@ -330,8 +317,8 @@ public class Xmodem {
                 case IDLE:
                 case RECEIVER_INIT:
                 case RECEIVING: // Stan przejściowy, nie powinniśmy tu odbierać nowych danych z bufora
-                case SENDING:   // Stan przejściowy
-                case SENDING_EOT: // Stan przejściowy
+                case SENDING:
+                case SENDING_EOT:
                 case COMPLETED:
                 case ABORTED:
                 case ERROR:
@@ -342,10 +329,10 @@ public class Xmodem {
                     break; // Ignoruj dane w tych stanach
 
                 default:
-                    // Nieznany stan - błąd programistyczny
+                    // Nieznany stan
                     byte unknownStateByte = extractBytesFromBuffer(1)[0];
                     LOGGER.severe("Nieobsługiwany stan: " + currentState + ". Ignorowanie bajtu: " + String.format("0x%02X", unknownStateByte));
-                    abortTransfer(false); // Anuluj dla bezpieczeństwa
+                    abortTransfer(false);
                     return; // Zakończ przetwarzanie
             }
 
@@ -375,7 +362,6 @@ public class Xmodem {
         for (int i = 0; i < count; i++) {
             extracted[i] = receiveBuffer.removeFirst(); // Usuń i pobierz pierwszy element
         }
-        //LOGGER.finest("Wyciągnięto " + count + " bajtów z bufora. Pozostało: " + receiveBuffer.size());
         return extracted;
     }
 
@@ -518,7 +504,6 @@ public class Xmodem {
         // System.out.println("Resetuję timeout odbiornika (" + ACK_TIMEOUT_MS + "ms) na SOH/EOT.");
         // Używamy krótszego timeoutu, gdy już trwa transmisja
         timeoutTaskHandler = timeoutScheduler.schedule(this::handleReceiveTimeout, ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-        //LOGGER.finest("Zresetowano timeout odbiornika (" + ACK_TIMEOUT_MS + "ms)");
     }
 
     /**
@@ -536,16 +521,11 @@ public class Xmodem {
         // Sprawdź, czy strumień jest dostępny i nie został zamknięty
             if (fileOutputStream == null) {
                 LOGGER.info("Otwieranie strumienia do pliku: " + outputFileName);
-                // Sprawdź czy plik istnieje i ew. usuń (opcjonalne, zależy od wymagań)
-                // Files.deleteIfExists(Paths.get(outputFileName));
                 fileOutputStream = new FileOutputStream(outputFileName, false); // false = nadpisz, jeśli istnieje
                 fileStreamClosed = false; // Strumień jest teraz otwarty
             }
             // Zapisz dane do strumienia
             fileOutputStream.write(payload);
-            //LOGGER.finest("Zapisano " + payload.length + " bajtów do pliku.");
-            // flush() może spowalniać, ale daje pewność zapisu; można rozważyć usunięcie dla wydajności
-            // fileOutputStream.flush();
             return true;
         } catch (IOException e) {
             LOGGER.log(Level.SEVERE, "Błąd I/O podczas zapisu do pliku: " + outputFileName, e);
@@ -562,10 +542,7 @@ public class Xmodem {
      * Wysyła bajt potwierdzenia ACK (0x06) do nadajnika.
      */
     private void sendAck() {
-        //LOGGER.finest("[Odbiornik] Wysyłanie ACK");
         communicator.sendData(new byte[]{ACK});
-        // Po wysłaniu ACK, zazwyczaj resetujemy timeout oczekiwania na kolejny pakiet (robione w processXmodemBlock)
-        // która wie, na co teraz czekamy.
     }
 
     /**
@@ -685,7 +662,6 @@ public class Xmodem {
                 LOGGER.info("Nie znaleziono końcowego paddingu SUB do usunięcia.");
             }
         }
-        // Inne IOException również są przekazywane dalej
     }
 
 
@@ -745,7 +721,6 @@ public class Xmodem {
                 fileStreamClosed = true;
             }
         } else {
-             //LOGGER.finest("Strumień pliku był już zamknięty lub nie został otwarty.");
              fileStreamClosed = true; // Upewnij się, że flaga jest true
         }
     }
@@ -756,11 +731,8 @@ public class Xmodem {
      */
     private void cancelTimeoutTask() {
         if (timeoutTaskHandler != null && !timeoutTaskHandler.isDone()) {
-                // System.out.println("Anulowanie aktywnego timeoutu.");
             timeoutTaskHandler.cancel(false); // false - nie przerywaj, jeśli już działa (co nie powinno mieć miejsca dla timeoutu)
-            //LOGGER.finest("Anulowano poprzedni task timeoutu.");
             timeoutTaskHandler = null;
-            // System.out.println("Anulowano timeout task."); // Opcjonalny log
         }
     }
 
@@ -788,7 +760,7 @@ public class Xmodem {
         this.useCRC = useCRC;
         this.currentBlockIndex = 0;
         this.sendRetries = 0;
-        this.receiveBuffer.clear(); // Wyczyść bufor na wypadek śmieci
+        this.receiveBuffer.clear();
 
         // Wczytaj plik do pamięci
         try {
@@ -796,7 +768,6 @@ public class Xmodem {
             if (fileData.length == 0) {
                 LOGGER.warning("Plik '" + filePath + "' jest pusty. Nie ma czego wysyłać.");
                 // Można by wysłać EOT od razu, ale standardowo XMODEM tego nie przewiduje
-                // Zakończmy jako błąd lub anulowanie
                 changeState(TransferState.ERROR); // Lub ABORTED
                 return;
             }
@@ -869,8 +840,6 @@ public class Xmodem {
             }
         } else {
             LOGGER.warning("Timeout wystąpił w nieoczekiwanym stanie nadajnika: " + currentState);
-            // Możliwy błąd, rozważ anulowanie
-            // abortTransfer(false);
         }
          // Timeouty w innych stanach są ignorowane
     }
@@ -881,8 +850,6 @@ public class Xmodem {
      */
     private void resetAckTimeout() {
         cancelTimeoutTask();
-        //LOGGER.finest("Ustawiono timeout oczekiwania na ACK/NAK (" + ACK_TIMEOUT_MS + "ms)");
-        // System.out.println("Resetuję timeout nadajnika (" + ACK_TIMEOUT_MS + "ms) na oczekiwanie ACK/NAK dla bloku " + (currentBlockIndex + 1));
         timeoutTaskHandler = timeoutScheduler.schedule(this::handleSendTimeout, ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
     }
 
@@ -892,7 +859,6 @@ public class Xmodem {
      */
     private void resetEotAckTimeout() {
         cancelTimeoutTask();
-        //LOGGER.finest("Ustawiono timeout oczekiwania na ACK po EOT (" + EOT_ACK_TIMEOUT_MS + "ms)");
         timeoutTaskHandler = timeoutScheduler.schedule(this::handleSendTimeout, EOT_ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
     }
 
@@ -980,7 +946,7 @@ public class Xmodem {
                     cancelTimeoutTask();
                     LOGGER.info("[Nadajnik] Odebrano końcowe ACK po EOT. Transfer zakończony pomyślnie.");
                     changeState(TransferState.COMPLETED); // Ustaw stan końcowy
-                } else if (receivedByte == CAN) { // Teoretycznie możliwe, choć mało prawdopodobne
+                } else if (receivedByte == CAN) {
                      extractBytesFromBuffer(1);
                      cancelTimeoutTask();
                      LOGGER.warning("[Nadajnik] Odebrano CAN podczas oczekiwania na końcowe ACK. Anulowanie transferu.");
@@ -1190,27 +1156,6 @@ public class Xmodem {
              // System.out.println("Czyszczenie danych pliku z pamięci.");
             currentState = newState;
         }
-    }
-
-    // --- Główna metoda (przykład użycia, może być w innej klasie) ---
-    public static void main(String[] args) {
-        // Tutaj można dodać przykładowy kod inicjujący SerialCommunicator
-        // i uruchamiający transfer Xmodem jako nadajnik lub odbiornik.
-        // Np.:
-        // SerialCommunicator communicator = new SerialCommunicator("COM3", 9600); // Przykładowa inicjalizacja
-        // Xmodem xmodem = new Xmodem(communicator);
-        //
-        // // Odbiór:
-        // xmodem.setOutputFileName("otrzymany_plik.txt");
-        // xmodem.startReceive(true); // Odbiór z CRC
-        //
-        // // lub Wysyłanie:
-        // xmodem.startSend("plik_do_wyslania.txt", true); // Wysyłanie z CRC
-
-        // W rzeczywistej aplikacji potrzebna byłaby pętla lub mechanizm
-        // do przekazywania danych z communicator.readBytes() do xmodem.ReceivedDataFromSerial()
-        // oraz obsługa stanów (np. sprawdzanie getCurrentState() do wyświetlania postępu lub zakończenia).
-        System.out.println("Klasa Xmodem gotowa. Użyj metody startSend() lub startReceive() aby rozpocząć transfer.");
     }
 
 

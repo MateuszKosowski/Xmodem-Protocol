@@ -121,8 +121,6 @@ public class SerialCommunicator implements SerialPortDataListener {
                 System.out.println("--> Wysłano " + message.length + " bajtów: [" + hexFormat.formatHex(message) + "]");
             } catch (IOException e) {
                 System.err.println("Błąd podczas wysyłania danych: " + e.getMessage());
-                // Rozważ powiadomienie handlera Xmodem o błędzie.
-                // if (xmodem != null) xmodem.notifyError("Send Error: " + e.getMessage());
             }
         } else {
             System.err.println("Błąd: Port nie jest otwarty lub strumień wyjściowy jest niedostępny. Nie można wysłać danych.");
