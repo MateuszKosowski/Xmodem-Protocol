@@ -52,6 +52,7 @@ public class Xmodem {
     private final List<Byte> receiveBuffer = new ArrayList<>(); // Bufor na przychodzące dane (NOWOŚĆ: kluczowy dla poprawnego działania)
     private String outputFileName; // Nazwa pliku do zapisu (odbiornik)
     private FileOutputStream fileOutputStream; // Strumień do zapisu pliku (odbiornik)
+    private volatile boolean fileStreamClosed = false; // NOWA FLAGA: Śledzi, czy strumień został już zamknięty
     private boolean useCRC = false; // Czy używać CRC (true) czy sumy kontrolnej (false)
 
     private int expectedBlockNumber = 1; // Oczekiwany numer bloku (odbiornik)
@@ -93,40 +94,43 @@ public class Xmodem {
      */
     public void startReceive(boolean useCRC) {
         if (currentState != TransferState.IDLE) {
-            System.err.println("Nie można rozpocząć odbioru, transfer już w toku lub nie zakończony poprawnie. Stan: " + currentState);
+            System.err.println("Błąd: Nie można rozpocząć odbioru, gdy transfer jest w stanie " + currentState);
             return;
         }
         if (outputFileName == null || outputFileName.isEmpty()) {
-            System.err.println("Nie ustawiono nazwy pliku wyjściowego.");
+            System.err.println("Błąd: Nie ustawiono nazwy pliku wyjściowego.");
             currentState = TransferState.ERROR;
             return;
         }
 
+        // Otwórz plik do zapisu
         try {
-            // Utwórz ścieżki i plik
-            File file = new File(outputFileName);
-            File parentDir = file.getParentFile();
+            // Upewnij się, że katalogi nadrzędne istnieją
+            File outputFile = new File(outputFileName);
+            File parentDir = outputFile.getParentFile();
             if (parentDir != null && !parentDir.exists()) {
                 if (!parentDir.mkdirs()) {
-                     throw new IOException("Nie można utworzyć katalogu: " + parentDir.getAbsolutePath());
+                    throw new IOException("Nie można utworzyć katalogów dla pliku: " + outputFileName);
                 }
             }
-            fileOutputStream = new FileOutputStream(file);
-            System.out.println("Plik wyjściowy otwarty: " + outputFileName);
-
-            this.useCRC = useCRC;
-            this.expectedBlockNumber = 1;
-            this.receiveRetries = 0;
-            this.currentState = TransferState.RECEIVER_INIT; // Ustaw stan na inicjalizację
-            System.out.println("Rozpoczynanie odbioru. Tryb: " + (useCRC ? "CRC" : "Suma kontrolna"));
-            initiateTransferSignal(); // Wyślij pierwszy NAK/C i ustaw timeout
-
+            fileOutputStream = new FileOutputStream(outputFileName);
+            fileStreamClosed = false; // Strumień właśnie został otwarty
+            System.out.println("[Odbiornik] Otwarto plik do zapisu: " + outputFileName);
         } catch (IOException e) {
-            System.err.println("Błąd podczas otwierania pliku wyjściowego '" + outputFileName + "': " + e.getMessage());
+            System.err.println("Błąd krytyczny: Nie można otworzyć pliku do zapisu '" + outputFileName + "': " + e.getMessage());
             currentState = TransferState.ERROR;
-            closeResources(); // Zamknij plik, jeśli się otworzył
+            return;
         }
+
+        this.useCRC = useCRC;
+        currentState = TransferState.RECEIVER_INIT;
+        expectedBlockNumber = 1;
+        receiveRetries = 0;
+        receiveBuffer.clear(); // Wyczyść bufor na wszelki wypadek
+        System.out.println("[Odbiornik] Rozpoczynam odbiór " + (useCRC ? "z CRC ('C')" : "z sumą kontrolną (NAK)"));
+        initiateTransferSignal(); // Wyślij pierwszy NAK lub 'C'
     }
+
 
     /**
      * Wysyła początkowy NAK lub 'C' i ustawia timeout oczekiwania na pierwszy blok (SOH).
@@ -508,38 +512,33 @@ public class Xmodem {
     }
 
     /**
-
      * Zapisuje dane (payload) do otwartego pliku.
-     * Usuwa znaki wypełnienia SUB (0x1A) z końca danych.
+     * NIE usuwa znaków wypełnienia SUB (0x1A) - to nastąpi na końcu.
      * @param payload Dane do zapisania (128 bajtów).
      * @return true jeśli zapis się powiódł, false w przypadku błędu IO.
      */
     private boolean savePayloadToFile(byte[] payload) {
-        if (fileOutputStream == null) {
-            System.err.println("Błąd krytyczny: Próba zapisu do pliku, ale strumień jest null.");
+        // Sprawdź, czy strumień jest dostępny i nie został zamknięty
+        if (fileOutputStream == null || fileStreamClosed) {
+            System.err.println("Błąd krytyczny: Próba zapisu do pliku, gdy fileOutputStream jest null lub został już zamknięty!");
+            // Jeśli nie jest zamknięty, to znaczy że jest null - błąd inicjalizacji, anuluj
+            if (!fileStreamClosed) {
+                abortTransfer(false);
+            }
             return false;
         }
         try {
-            // Znajdź pierwszy znak SUB od końca lub koniec danych
-                // Opcjonalnie: usuń znaki SUB (0x1A) z końca bloku, jeśli istnieją
-            int endOfData = payload.length;
-            while (endOfData > 0 && payload[endOfData - 1] == SUB) {
-                endOfData--;
-            }
-
-            if (endOfData > 0) {
-                 // System.out.println("Zapisuję " + endOfData + " bajtów danych do pliku.");
-                fileOutputStream.write(payload, 0, endOfData);
-                fileOutputStream.flush(); // Opcjonalnie, dla pewności zapisu
-            } else {
-                 System.out.println("Blok zawierał same znaki SUB, nic nie zapisano.");
-            }
+            fileOutputStream.write(payload);
+            // flush() może spowalniać, ale daje pewność zapisu; można rozważyć usunięcie dla wydajności
+            // fileOutputStream.flush();
             return true;
         } catch (IOException e) {
-            System.err.println("Błąd podczas zapisu danych do pliku: " + e.getMessage());
+            System.err.println("Błąd zapisu do pliku: " + e.getMessage());
+            // Błąd zapisu jest krytyczny, ale decyzję o anulowaniu podejmuje processXmodemBlock/handleBlockError
             return false;
         }
     }
+
 
     /**
      * Wysyła ACK (potwierdzenie).
@@ -581,18 +580,122 @@ public class Xmodem {
 
     /**
      * Kończy transfer po odebraniu EOT.
-     * Wysyła ostatnie ACK i ustawia stan na COMPLETED.
+     * Wysyła ostatnie ACK, zamyka plik, usuwa padding i ustawia stan na COMPLETED.
      * Wywoływana przez `processInternalBuffer`.
      */
     private void completeTransfer() {
-        // cancelTimeoutTask(); // Już anulowany w processInternalBuffer przed wywołaniem
+        cancelTimeoutTask(); // Anuluj ewentualny timeout oczekiwania na SOH
+
+        // Sprawdź stan - powinien być EXPECTING_SOH lub RECEIVING (jeśli EOT przyszło od razu po bloku)
+        if (currentState != TransferState.EXPECTING_SOH && currentState != TransferState.RECEIVING) {
+            System.err.println("[Odbiornik] Ostrzeżenie: Odebrano EOT w niespodziewanym stanie " + currentState + ".");
+            // Mimo wszystko kontynuujemy proces kończenia
+        }
+
         System.out.println("\n[Odbiornik] Odebrano EOT. Kończenie transferu.");
-        sendAck(); // Wyślij ostatnie ACK jako potwierdzenie EOT
-        currentState = TransferState.COMPLETED;
-        closeResources(); // Zamknij plik wyjściowy
-        System.out.println("Transfer zakończony pomyślnie. Plik zapisany jako: " + outputFileName);
-        // Wątek główny wykryje zmianę stanu
+        sendAck(); // Wyślij ostatnie ACK potwierdzające EOT
+
+        // --- Zamykanie pliku i usuwanie paddingu SUB ---
+        if (fileOutputStream != null && !fileStreamClosed) {
+            try {
+                fileOutputStream.close(); // Zamknij strumień teraz, aby upewnić się, że wszystkie dane są zapisane
+                fileStreamClosed = true; // Oznacz jako zamknięty
+                System.out.println("[Odbiornik] Strumień pliku zamknięty.");
+
+                // Teraz usuń padding SUB z końca pliku
+                removeTrailingSubPadding();
+
+            } catch (IOException e) {
+                System.err.println("Błąd podczas zamykania pliku przed usunięciem paddingu: " + e.getMessage());
+                // Mimo błędu zamykania, próbujemy usunąć padding, ale transfer uznajemy za zakończony z potencjalnymi problemami.
+                // Spróbuj usunąć padding nawet jeśli zamknięcie się nie powiodło (choć to mało prawdopodobne)
+                try {
+                    removeTrailingSubPadding();
+                } catch (IOException suppress) {
+                    System.err.println("Dodatkowy błąd podczas próby usunięcia paddingu po błędzie zamknięcia: " + suppress.getMessage());
+                }
+            } finally {
+                fileOutputStream = null; // Ustaw na null, bo strumień jest (lub powinien być) zamknięty
+            }
+        } else if (fileStreamClosed) {
+            System.out.println("[Odbiornik] Strumień pliku był już zamknięty (np. przez błąd zapisu lub anulowanie) przed odebraniem EOT. Nie usuwam paddingu.");
+        } else {
+            // To nie powinno się zdarzyć, jeśli startReceive poprawnie otworzył plik
+            System.err.println("[Odbiornik] Błąd krytyczny: fileOutputStream był null na etapie kończenia transferu.");
+            currentState = TransferState.ERROR; // Błąd wewnętrzny
+            return; // Zakończ, nie ustawiaj COMPLETED
+        }
+
+        // Ustaw stan COMPLETED tylko jeśli nie ustawiono wcześniej ERROR
+        if (currentState != TransferState.ERROR) {
+            currentState = TransferState.COMPLETED;
+            System.out.println("[Odbiornik] Transfer zakończony pomyślnie.");
+        }
     }
+
+    /**
+     * NOWA METODA POMOCNICZA: Usuwa końcowe bajty SUB (0x1A) z pliku.
+     * Wywoływana przez completeTransfer PO zamknięciu FileOutputStream.
+     */
+    private void removeTrailingSubPadding() throws IOException {
+        System.out.println("[Odbiornik] Sprawdzanie i usuwanie paddingu SUB z pliku: " + outputFileName);
+        try (RandomAccessFile raf = new RandomAccessFile(outputFileName, "rw")) {
+            long fileSize = raf.length();
+            if (fileSize == 0) {
+                System.out.println("[Odbiornik] Plik jest pusty, brak paddingu do usunięcia.");
+                return; // Plik pusty, nic do roboty
+            }
+
+            // XMODEM dodaje padding tylko do ostatniego bloku (128 bajtów)
+            // Musimy sprawdzić bajty od końca, ale maksymalnie 128
+            long startCheckPos = Math.max(0, fileSize - BLOCK_SIZE);
+            raf.seek(startCheckPos); // Ustaw wskaźnik na początek potencjalnego obszaru paddingu
+
+            // Odczytaj potencjalny ostatni blok (lub mniej, jeśli plik jest krótszy)
+            int bytesToCheck = (int) (fileSize - startCheckPos);
+            byte[] lastBytes = new byte[bytesToCheck];
+            int readCount = raf.read(lastBytes);
+
+            if (readCount != bytesToCheck) {
+                // To nie powinno się zdarzyć, jeśli seek/length działają poprawnie
+                throw new IOException("Nie udało się odczytać oczekiwanej liczby bajtów (" + bytesToCheck + ") z końca pliku.");
+            }
+
+            // Znajdź indeks ostatniego bajtu, który NIE jest SUB
+            int lastNonSubIndex = -1;
+            for (int i = readCount - 1; i >= 0; i--) {
+                if (lastBytes[i] != SUB) {
+                    lastNonSubIndex = i;
+                    break;
+                }
+            }
+
+            // Oblicz nowy rozmiar pliku
+            long newLength;
+            if (lastNonSubIndex == -1) {
+                // Wszystkie sprawdzone bajty (cały ostatni blok lub cały plik, jeśli krótszy) to SUB
+                newLength = startCheckPos; // Obetnij do początku sprawdzanego obszaru
+            } else {
+                // Znaleziono bajt niebędący SUB, nowy rozmiar to pozycja tego bajtu + 1
+                newLength = startCheckPos + lastNonSubIndex + 1;
+            }
+
+            // Jeśli nowy rozmiar jest mniejszy niż obecny, obetnij plik
+            if (newLength < fileSize) {
+                raf.setLength(newLength); // Obetnij plik
+                System.out.println("[Odbiornik] Usunięto padding SUB. Nowy rozmiar pliku: " + newLength + " (usunięto " + (fileSize - newLength) + " bajtów)");
+            } else {
+                System.out.println("[Odbiornik] Nie znaleziono paddingu SUB na końcu pliku.");
+            }
+        } catch (FileNotFoundException e) {
+            // Plik mógł zostać usunięty w międzyczasie? Mało prawdopodobne.
+            System.err.println("Błąd krytyczny: Nie można ponownie otworzyć pliku '" + outputFileName + "' do usunięcia paddingu: " + e.getMessage());
+            throw e; // Przekaż wyjątek dalej, aby oznaczyć transfer jako ERROR
+        }
+        // Inne IOException również są przekazywane dalej
+    }
+
+
 
     /**
      * Anuluje transfer. Wysyła CAN (jeśli inicjowane lokalnie),
@@ -600,33 +703,44 @@ public class Xmodem {
      * @param remoteInitiated True, jeśli anulowanie zostało zainicjowane przez odebranie CAN.
      */
     void abortTransfer(boolean remoteInitiated) {
-        // Sprawdź, czy już nie jesteśmy w stanie końcowym, aby uniknąć podwójnego anulowania
+        cancelTimeoutTask(); // Anuluj bieżący timeout
+
         if (currentState == TransferState.ABORTED || currentState == TransferState.COMPLETED || currentState == TransferState.ERROR) {
-            System.out.println("Próba anulowania transferu, który jest już w stanie końcowym: " + currentState);
+            // Już w stanie końcowym, nic nie rób
             return;
         }
 
-        System.out.println("!!! Anulowanie transferu !!! (Inicjowane " + (remoteInitiated ? "zdalnie" : "lokalnie") + ")");
-        cancelTimeoutTask(); // Zawsze anuluj aktywny timeout
+        System.out.println("\n[Xmodem] Anulowanie transferu... (Zdalnie: " + remoteInitiated + ", Stan: " + currentState + ")");
 
-        if (!remoteInitiated) {
-            // Jeśli my inicjujemy przerwanie, wyślij dwa znaki CAN dla pewności
-            System.out.println("--> Wysyłam CAN x2.");
+        if (!remoteInitiated && currentState != TransferState.IDLE) {
+            // Wyślij CAN dwukrotnie dla pewności, jeśli my anulujemy
             byte[] cancelSignal = {CAN, CAN};
             communicator.sendData(cancelSignal);
-            // Krótka pauza, aby dać czas na wysłanie CAN przed potencjalnym zamknięciem portu
-            try { Thread.sleep(100); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+            System.out.println("[Xmodem] Wysłano sygnał CAN.");
         }
 
         currentState = TransferState.ABORTED;
+        receiveBuffer.clear(); // Wyczyść bufor odbiorczy
 
-        closeResources(); // Zamknij plik (jeśli otwarty) i wyczyść dane nadajnika
-        synchronized (receiveBuffer) { // Wyczyść bufor na wszelki wypadek
-            System.out.println("Czyszczenie bufora odbiorczego (" + receiveBuffer.size() + " bajtów).");
-            receiveBuffer.clear();
+        // Zamknij strumień pliku, jeśli jest otwarty i jeszcze nie zamknięty
+        if (fileOutputStream != null && !fileStreamClosed) {
+            try {
+                fileOutputStream.close();
+                System.out.println("[Xmodem] Strumień pliku zamknięty podczas anulowania.");
+            } catch (IOException e) {
+                System.err.println("Błąd podczas zamykania pliku przy anulowaniu: " + e.getMessage());
+            } finally {
+                fileOutputStream = null; // Niezależnie od błędu, ustaw na null
+                fileStreamClosed = true; // Oznacz jako zamknięty
+            }
+        } else if (fileStreamClosed) {
+            System.out.println("[Xmodem] Strumień pliku był już zamknięty podczas anulowania.");
         }
-        System.out.println("Transfer przerwany.");
+
+        System.out.println("[Xmodem] Transfer anulowany.");
+        // Nie wyłączamy tutaj schedulera, zrobi to Main na końcu
     }
+
 
     /**
      * Anuluje bieżący timeout task, jeśli istnieje i nie został jeszcze wykonany.
