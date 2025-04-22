@@ -7,533 +7,551 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.*;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
+
+/**
+ * Implementacja protokołu transferu plików XMODEM (z obsługą sumy kontrolnej i CRC-16).
+ * Pozwala na wysyłanie i odbieranie plików przez port szeregowy przy użyciu
+ * obiektu {@link SerialCommunicator}.
+ */
 public class Xmodem {
 
-    // --- Stałe protokołu ---
-    private static final byte SOH = 0x01;    // Start of Header (pakiet 128 bajtów danych)
-    private static final byte EOT = 0x04;    // End of Transmission
-    private static final byte ACK = 0x06;    // Acknowledge (potwierdzenie)
-    private static final byte NAK = 0x15;    // Negative Acknowledge (brak potwierdzenia, żądanie retransmisji)
+    private static final Logger LOGGER = Logger.getLogger(Xmodem.class.getName());
+
+    // --- Stałe protokołu XMODEM ---
+    private static final byte SOH = 0x01;    // Start of Header (początek bloku 128 bajtów danych)
+    private static final byte EOT = 0x04;    // End of Transmission (koniec transmisji)
+    private static final byte ACK = 0x06;    // Acknowledge (potwierdzenie odebrania bloku)
+    private static final byte NAK = 0x15;    // Negative Acknowledge (żądanie retransmisji bloku)
     private static final byte CAN = 0x18;    // Cancel (anulowanie transmisji)
-    private static final byte SUB = 0x1A;    // Substitute (znak wypełniający, Ctrl+Z)
-    private static final byte CHAR_C = 0x43; // 'C' - żądanie rozpoczęcia transmisji z CRC
+    private static final byte SUB = 0x1A;    // Substitute (znak wypełniający dane, Ctrl+Z)
+    private static final byte CHAR_C = 0x43; // Znak 'C' (żądanie rozpoczęcia transmisji z CRC-16 przez odbiornik)
 
-    // --- Konfiguracja transferu ---
-    private static final int BLOCK_SIZE = 128; // Standardowy rozmiar bloku danych
-    private static final int MAX_RETRIES = 10;   // Maksymalna liczba prób retransmisji bloku (nadajnik) / odbioru bloku (odbiornik)
-    private static final int MAX_INIT_RETRIES = 6; // Max prób wysłania NAK/C na początku przez odbiornik (6 * 10s = 1 minuta) lub max czas czekania nadajnika na NAK/C
-    private static final long INIT_TIMEOUT_MS = 10000; // Czas oczekiwania odbiornika na pierwszy blok (SOH) po wysłaniu NAK/C (10 sekund) lub czas oczekiwania nadajnika na NAK/C
-    private static final long ACK_TIMEOUT_MS = 5000;  // Czas oczekiwania na ACK/NAK po wysłaniu bloku (nadajnik) lub czas oczekiwania na kolejny SOH/EOT po wysłaniu ACK (odbiornik)
-    private static final long EOT_ACK_TIMEOUT_MS = 5000; // Czas oczekiwania na ACK po wysłaniu EOT (nadajnik)
+    // --- Konfiguracja parametrów transferu ---
+    private static final int BLOCK_SIZE = 128; // Standardowy rozmiar bloku danych w bajtach
+    private static final int MAX_RETRIES = 10;   // Maksymalna liczba prób retransmisji jednego bloku (nadajnik) / ponownego odbioru (odbiornik)
+    private static final int MAX_INIT_RETRIES = 6; // Maksymalna liczba prób inicjalizacji (wysłania NAK/C przez odbiornik lub oczekiwania na NAK/C przez nadajnik)
+    private static final long INIT_TIMEOUT_MS = 10000; // Czas (ms) oczekiwania na pierwszy blok (SOH) po wysłaniu NAK/C (odbiornik) lub na NAK/C od odbiornika (nadajnik)
+    private static final long ACK_TIMEOUT_MS = 5000;  // Czas (ms) oczekiwania na ACK/NAK po wysłaniu bloku (nadajnik) lub na kolejny SOH/EOT po wysłaniu ACK (odbiornik)
+    private static final long EOT_ACK_TIMEOUT_MS = 5000; // Czas (ms) oczekiwania na ACK po wysłaniu EOT (nadajnik)
 
+    /**
+     * Definiuje możliwe stany, w jakich może znajdować się proces transferu XMODEM.
+     */
     // --- Stany transferu ---
     public enum TransferState {
-        IDLE,           // Bezczynny
-        // Stany odbiornika
-        RECEIVER_INIT,  // Odbiornik: Stan początkowy, wysyłanie NAK/C
-        EXPECTING_SOH,  // Odbiornik: Oczekuje na SOH (lub EOT)
-        RECEIVING,      // Odbiornik: Przetwarza odebrany blok SOH (stan przejściowy)
-        // Stany nadajnika
-        SENDER_WAIT_INIT, // Nadajnik: Czeka na NAK lub 'C' od odbiornika
-        SENDING,        // Nadajnik: Wysyła blok danych
-        WAITING_FOR_ACK,// Nadajnik: Czeka na ACK/NAK po wysłaniu bloku
-        SENDING_EOT,    // Nadajnik: Wysyła EOT
-        WAITING_FOR_EOT_ACK, // Nadajnik: Czeka na ACK po EOT
-        // Stany końcowe
-        COMPLETED,      // Transfer zakończony sukcesem
-        ABORTED,        // Transfer anulowany (przez CAN lub błędy)
-        ERROR           // Wystąpił błąd krytyczny (np. IO)
+        IDLE,           // Stan bezczynności, brak aktywnego transferu
+
+        // --- Stany Odbiornika ---
+        RECEIVER_INIT,  // Odbiornik: Inicjalizacja, wysyłanie sygnału NAK lub 'C'
+        EXPECTING_SOH,  // Odbiornik: Oczekiwanie na nagłówek bloku (SOH) lub koniec transmisji (EOT)
+        RECEIVING,      // Odbiornik: Aktywne przetwarzanie odebranego bloku danych (stan przejściowy)
+
+        // --- Stany Nadajnika ---
+        SENDER_WAIT_INIT, // Nadajnik: Oczekiwanie na sygnał inicjujący NAK lub 'C' od odbiornika
+        SENDING,        // Nadajnik: Wysyłanie bieżącego bloku danych
+        WAITING_FOR_ACK,// Nadajnik: Oczekiwanie na potwierdzenie (ACK) lub żądanie retransmisji (NAK)
+        SENDING_EOT,    // Nadajnik: Wysyłanie sygnału końca transmisji (EOT)
+        WAITING_FOR_EOT_ACK, // Nadajnik: Oczekiwanie na ostateczne potwierdzenie (ACK) po wysłaniu EOT
+
+        // --- Stany Końcowe ---
+        COMPLETED,      // Transfer zakończony pomyślnie
+        ABORTED,        // Transfer przerwany (przez sygnał CAN lub przekroczenie limitu błędów)
+        ERROR           // Wystąpił nieoczekiwany błąd krytyczny (np. błąd I/O)
     }
 
-    // --- Pola klasy ---
-    private volatile TransferState currentState = TransferState.IDLE; // Aktualny stan transferu (volatile dla bezpieczeństwa wątkowego)
-    private final SerialCommunicator communicator; // Obiekt do komunikacji przez port szeregowy
-    private final List<Byte> receiveBuffer = new ArrayList<>(); // Bufor na przychodzące dane (NOWOŚĆ: kluczowy dla poprawnego działania)
-    private String outputFileName; // Nazwa pliku do zapisu (odbiornik)
-    private FileOutputStream fileOutputStream; // Strumień do zapisu pliku (odbiornik)
-    private volatile boolean fileStreamClosed = false; // NOWA FLAGA: Śledzi, czy strumień został już zamknięty
-    private boolean useCRC = false; // Czy używać CRC (true) czy sumy kontrolnej (false)
+    // --- Pola instancji klasy ---
+    private volatile TransferState currentState; // Bieżący stan automatu skończonego (volatile dla bezpieczeństwa wątkowego)
+    private final SerialCommunicator communicator; // Obiekt odpowiedzialny za fizyczną komunikację przez port szeregowy
+    private final List<Byte> receiveBuffer = new ArrayList<>(); // Bufor na dane odbierane z portu szeregowego, przetwarzane przez processInternalBuffer
+    private String outputFileName; // Nazwa pliku, do którego zapisywane są odbierane dane (używane przez odbiornik)
+    private FileOutputStream fileOutputStream; // Strumień do zapisu danych do pliku wyjściowego (odbiornik)
+    private volatile boolean fileStreamClosed = false; // Flaga wskazująca, czy strumień do pliku wyjściowego został już zamknięty
+    private boolean useCRC = false; // Flaga określająca, czy używany jest tryb CRC-16 (true) czy suma kontrolna (false)
 
-    private int expectedBlockNumber = 1; // Oczekiwany numer bloku (odbiornik)
-    private int receiveRetries = 0; // Licznik prób inicjalizacji lub odbioru danego bloku (odbiornik)
-    private int sendRetries = 0; // Licznik prób wysłania danego bloku lub EOT (nadajnik) / prób inicjalizacji (nadajnik)
+    private int expectedBlockNumber = 1; // Numer kolejnego oczekiwanego bloku danych (odbiornik, zaczyna od 1)
+    private int receiveRetries = 0; // Licznik prób odbioru bieżącego bloku lub prób inicjalizacji (odbiornik)
+    private int sendRetries = 0; // Licznik prób wysłania bieżącego bloku lub EOT, lub prób inicjalizacji (nadajnik)
 
+    // Executor do zarządzania zadaniami czasowymi (timeout)
     // Wątek do obsługi timeoutów
     private final ScheduledExecutorService timeoutScheduler = Executors.newSingleThreadScheduledExecutor();
-    private ScheduledFuture<?> timeoutTaskHandler; // Uchwyt do bieżącego zadania timeoutu
+    private ScheduledFuture<?> timeoutTaskHandler; // Uchwyt do aktywnego zadania obsługi timeoutu
 
-    // Zmienne dla nadajnika
-    private byte[] fileData; // Dane pliku do wysłania (ładowane do pamięci)
-    private int currentBlockIndex = 0; // Indeks bieżącego bloku do wysłania (0-based)
+    // Zmienne specyficzne dla nadajnika
+    private byte[] fileData; // Zawartość pliku do wysłania, załadowana do pamięci
+    private int currentBlockIndex = 0; // Indeks (0-based) bieżącego bloku danych do wysłania
 
-    // --- Konstruktor ---
+    /**
+     * Konstruktor klasy Xmodem.
+     *
+     * @param communicator Obiekt {@link SerialCommunicator} do obsługi komunikacji szeregowej.
+     */
     public Xmodem(SerialCommunicator communicator) {
         this.communicator = communicator;
         if (this.communicator == null) {
+            LOGGER.log(Level.SEVERE, "SerialCommunicator nie może być null!");
             throw new IllegalArgumentException("SerialCommunicator nie może być null");
         }
-        // Upewnij się, że SerialCommunicator wie o tym Xmodem (może już ustawione w Main)
-        this.communicator.setXmodem(this);
+        this.currentState = TransferState.IDLE;
     }
 
+    /**
+     * Ustawia nazwę pliku wyjściowego dla odbieranych danych.
+     * Powinno być wywołane przed rozpoczęciem odbioru.
+     *
+     * @param fileName Nazwa pliku do zapisu.
+     */
     // --- Gettery / Settery ---
     public void setOutputFileName(String fileName) {
         this.outputFileName = fileName;
     }
 
+    /**
+     * Zwraca bieżący stan transferu XMODEM.
+     *
+     * @return Aktualny stan z enum {@link TransferState}.
+     */
     public TransferState getCurrentState() {
         return currentState;
     }
 
+    // =========================================================================
     // --- Metody Odbiornika ---
+    // =========================================================================
 
     /**
-     * Rozpoczyna proces odbierania pliku.
-     * @param useCRC Jeśli true, żąda użycia CRC ('C'), w przeciwnym razie sumy kontrolnej (NAK).
+     * Inicjuje proces odbierania pliku w trybie XMODEM.
+     * Ustawia stan początkowy i wysyła pierwszy sygnał NAK lub 'C'.
+     *
+     * @param useCRC Jeśli true, odbiornik zażąda transferu z CRC-16 (wysyłając 'C').
+     *               Jeśli false, zażąda transferu ze standardową sumą kontrolną (wysyłając NAK).
      */
     public void startReceive(boolean useCRC) {
         if (currentState != TransferState.IDLE) {
-            System.err.println("Błąd: Nie można rozpocząć odbioru, gdy transfer jest w stanie " + currentState);
-            return;
+            LOGGER.warning("Próba rozpoczęcia odbioru, gdy transfer jest już w toku lub nie został poprawnie zakończony. Stan: " + currentState);
+            return; // Można rozważyć rzucenie wyjątku
         }
         if (outputFileName == null || outputFileName.isEmpty()) {
-            System.err.println("Błąd: Nie ustawiono nazwy pliku wyjściowego.");
-            currentState = TransferState.ERROR;
+            LOGGER.severe("Nie ustawiono nazwy pliku wyjściowego przed rozpoczęciem odbioru.");
+            changeState(TransferState.ERROR);
             return;
         }
 
-        // Otwórz plik do zapisu
-        try {
-            // Upewnij się, że katalogi nadrzędne istnieją
-            File outputFile = new File(outputFileName);
-            File parentDir = outputFile.getParentFile();
-            if (parentDir != null && !parentDir.exists()) {
-                if (!parentDir.mkdirs()) {
-                    throw new IOException("Nie można utworzyć katalogów dla pliku: " + outputFileName);
-                }
-            }
-            fileOutputStream = new FileOutputStream(outputFileName);
-            fileStreamClosed = false; // Strumień właśnie został otwarty
-            System.out.println("[Odbiornik] Otwarto plik do zapisu: " + outputFileName);
-        } catch (IOException e) {
-            System.err.println("Błąd krytyczny: Nie można otworzyć pliku do zapisu '" + outputFileName + "': " + e.getMessage());
-            currentState = TransferState.ERROR;
-            return;
-        }
-
+        LOGGER.info("Rozpoczynanie odbioru pliku: " + outputFileName + " (CRC: " + useCRC + ")");
         this.useCRC = useCRC;
-        currentState = TransferState.RECEIVER_INIT;
-        expectedBlockNumber = 1;
-        receiveRetries = 0;
-        receiveBuffer.clear(); // Wyczyść bufor na wszelki wypadek
-        System.out.println("[Odbiornik] Rozpoczynam odbiór " + (useCRC ? "z CRC ('C')" : "z sumą kontrolną (NAK)"));
-        initiateTransferSignal(); // Wyślij pierwszy NAK lub 'C'
+        this.expectedBlockNumber = 1;
+        this.receiveRetries = 0;
+        this.receiveBuffer.clear();
+        this.fileStreamClosed = true; // Zakładamy, że jest zamknięty, dopóki nie otworzymy
+        this.fileOutputStream = null; // Upewnij się, że jest null na start
+
+        // Zmień stan na inicjalizację odbiornika
+        changeState(TransferState.RECEIVER_INIT);
+        // Wyślij pierwszy sygnał NAK lub 'C' i ustaw timeout
+        initiateTransferSignal();
     }
 
 
     /**
-     * Wysyła początkowy NAK lub 'C' i ustawia timeout oczekiwania na pierwszy blok (SOH).
-     * Wywoływane w stanie RECEIVER_INIT.
+     * Wysyła początkowy sygnał NAK lub 'C' do nadajnika, aby zainicjować transfer.
+     * Ustawia również timeout oczekiwania na pierwszy blok danych (SOH).
+     * Metoda wywoływana wewnętrznie podczas inicjalizacji odbioru (stan RECEIVER_INIT).
      */
     private void initiateTransferSignal() {
-        cancelTimeoutTask(); // Anuluj stary timeout, jeśli istnieje
+        if (currentState != TransferState.RECEIVER_INIT) return;
+
         if (receiveRetries >= MAX_INIT_RETRIES) {
-            System.err.println("Przekroczono maksymalną liczbę prób inicjalizacji odbioru. Anuluję.");
-            abortTransfer(false);
+            LOGGER.severe("Przekroczono limit prób inicjalizacji odbioru (" + MAX_INIT_RETRIES + "). Anulowanie transferu.");
+            abortTransfer(false); // Anuluj transfer lokalnie
             return;
         }
 
         byte signal = useCRC ? CHAR_C : NAK;
-        System.out.println("--> Wysyłam sygnał inicjujący: " + (useCRC ? "'C'" : "NAK") + " (próba " + (receiveRetries + 1) + ")");
+        String signalName = useCRC ? "'C'" : "NAK";
+        LOGGER.info("[Odbiornik] Wysyłanie sygnału inicjującego " + signalName + " (próba " + (receiveRetries + 1) + "/" + MAX_INIT_RETRIES + ")");
         communicator.sendData(new byte[]{signal});
-        currentState = TransferState.EXPECTING_SOH; // Po wysłaniu sygnału czekamy na SOH
+        receiveRetries++;
 
-        // Ustaw timeout oczekiwania na SOH
+        // Ustaw timeout oczekiwania na pierwszy SOH
+        cancelTimeoutTask(); // Anuluj poprzedni, jeśli istnieje
         timeoutTaskHandler = timeoutScheduler.schedule(this::handleReceiveTimeout, INIT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-        System.out.println("Ustawiono timeout " + INIT_TIMEOUT_MS + "ms na oczekiwanie SOH/EOT.");
-        receiveRetries++; // Zwiększ licznik prób inicjalizacji
+
+        // Zmień stan na oczekiwanie na SOH (lub EOT, choć EOT na starcie jest błędem)
+        changeState(TransferState.EXPECTING_SOH);
     }
 
     /**
-     * Metoda wywoływana przez timeoutScheduler, gdy upłynie czas oczekiwania na SOH/EOT (odbiornik).
+     * Obsługuje sytuację timeoutu podczas odbioru danych.
+     * Wywoływana przez {@link ScheduledExecutorService}, gdy upłynie czas oczekiwania.
+     * W zależności od stanu, ponawia próbę inicjalizacji (wysyłając NAK/C)
+     * lub żąda retransmisji ostatniego bloku (wysyłając NAK).
      */
     private void handleReceiveTimeout() {
-        // Upewnij się, że timeout jest nadal aktywny (nie został anulowany przez odebranie danych)
-        if (timeoutTaskHandler == null || timeoutTaskHandler.isDone()) {
-            return; // Timeout został anulowany w międzyczasie
-        }
-
-        System.out.println("\n[Timeout Odbiornika] Nie odebrano SOH/EOT w oczekiwanym czasie.");
-
-        // Jeśli byliśmy w trakcie inicjalizacji (czekaliśmy na pierwszy SOH)
-        if (currentState == TransferState.EXPECTING_SOH && expectedBlockNumber == 1) {
-             System.out.println("Ponawiam wysłanie sygnału inicjującego NAK/C.");
-             currentState = TransferState.RECEIVER_INIT; // Wróć do stanu wysyłania NAK/C
-             initiateTransferSignal(); // Spróbuj ponownie wysłać NAK/C
-        }
-        // Jeśli czekaliśmy na kolejny blok (nie pierwszy) lub EOT
-        else if (currentState == TransferState.EXPECTING_SOH) {
-             System.out.println("Nie odebrano kolejnego bloku SOH ani EOT. Ponawiam wysłanie NAK.");
-             // Xmodem standardowo nie ponawia ACK, ale wysyła NAK jeśli nie dostaje bloku
-             // Zwiększamy licznik prób dla bieżącego bloku
-             receiveRetries++;
-             if (receiveRetries >= MAX_RETRIES) {
-                 System.err.println("Przekroczono maksymalną liczbę prób odbioru bloku " + expectedBlockNumber + ". Anuluję.");
-                 abortTransfer(false);
-             } else {
-                 sendNak(); // Wyślij NAK, żeby poprosić o retransmisję oczekiwanego bloku
-                 resetReceiveTimeout(); // Ustaw nowy timeout
-             }
+        if (currentState == TransferState.EXPECTING_SOH) {
+            // Timeout podczas oczekiwania na SOH lub EOT
+            if (expectedBlockNumber == 1 && receiveRetries < MAX_INIT_RETRIES) {
+                // Jeśli to timeout oczekiwania na pierwszy blok, ponów wysłanie NAK/C
+                LOGGER.warning("[Odbiornik] Timeout oczekiwania na pierwszy blok (SOH). Ponawiam sygnał inicjujący.");
+                changeState(TransferState.RECEIVER_INIT); // Wróć do stanu inicjalizacji
+                initiateTransferSignal(); // Wyślij NAK/C ponownie
+            } else if (expectedBlockNumber > 1 && receiveRetries < MAX_RETRIES) {
+                // Jeśli to timeout oczekiwania na kolejny blok (po poprawnym odebraniu poprzednich)
+                LOGGER.warning("[Odbiornik] Timeout oczekiwania na blok " + expectedBlockNumber + " (lub EOT). Wysyłam NAK.");
+                receiveRetries++;
+                sendNak(); // Wyślij NAK, żądając retransmisji
+                // Stan pozostaje EXPECTING_SOH, resetujemy timeout w sendNak()
+            } else {
+                // Przekroczono limit prób
+                LOGGER.severe("[Odbiornik] Przekroczono limit (" + (expectedBlockNumber == 1 ? MAX_INIT_RETRIES : MAX_RETRIES) + ") prób oczekiwania/odbioru. Anulowanie transferu.");
+                abortTransfer(false);
+            }
         } else {
+            // Timeout w innym, nieoczekiwanym stanie - może oznaczać błąd wewnętrzny
                  // Wysłanie NAK nie ma sensu, bo nie wiemy co poszło nie tak
                  // Można by spróbować anulować i zacząć od nowa, albo po prostu anulować
-             System.err.println("Timeout odbiornika w nieoczekiwanym stanie: " + currentState);
-             // Można rozważyć przerwanie transferu w takim przypadku
+            LOGGER.warning("Timeout wystąpił w nieoczekiwanym stanie odbiornika: " + currentState);
+            // Można rozważyć anulowanie transferu lub logowanie błędu
              // abortTransfer(false);
         }
         // Timeouty w innych stanach (np. IDLE, COMPLETED) są ignorowane
     }
 
     /**
-
-     * Główna metoda odbierająca dane z SerialCommunicator.
-     * NOWOŚĆ: Ta metoda *tylko* dodaje dane do `receiveBuffer` i wywołuje `processInternalBuffer`.
+     * Metoda publiczna wywoływana przez zewnętrzny komponent (np. listener portu szeregowego),
+     * gdy nowe dane zostaną odebrane z portu szeregowego.
+     * Dane są dodawane do wewnętrznego bufora, a następnie wywoływana jest metoda przetwarzająca bufor.
+     *
      * @param data Tablica bajtów odebrana z portu szeregowego.
      */
     public void ReceivedDataFromSerial(byte[] data) {
         if (data == null || data.length == 0) {
-            return;
+            return; // Ignoruj puste dane
         }
+
         // Synchronizacja na buforze jest ważna, aby uniknąć ConcurrentModificationException,
         // gdy wątek listenera portu dodaje dane, a wątek przetwarzający (lub timeout) może je modyfikować.
         // Dodaj odebrane bajty do wewnętrznego bufora
+        // Synchronizacja jest potrzebna, jeśli ta metoda może być wywołana z innego wątku niż processInternalBuffer
         synchronized (receiveBuffer) {
             for (byte b : data) {
                 receiveBuffer.add(b);
             }
-            // Logowanie może być przydatne, ale generuje dużo danych
-            // System.out.println("<-- Dodano " + data.length + " bajtów do bufora. Rozmiar: " + receiveBuffer.size());
         }
-        // Po dodaniu danych, spróbuj przetworzyć zawartość bufora.
-        // Przetwórz bufor
+            // Logowanie może być przydatne, ale generuje dużo danych
+        //LOGGER.finest("[Odbiornik] Dodano " + data.length + " bajtów do bufora. Rozmiar bufora: " + receiveBuffer.size());
+
+
+        // Uruchom przetwarzanie danych w buforze
         processInternalBuffer();
     }
 
     /**
-     * NOWOŚĆ: Przetwarza dane zgromadzone w `receiveBuffer`.
-     * Działa w pętli, dopóki może zinterpretować i przetworzyć kompletne jednostki Xmodem
-     * (pojedyncze bajty sterujące lub całe bloki SOH) z początku bufora.
-     * Metoda jest `synchronized`, aby zapewnić, że tylko jeden wątek na raz przetwarza bufor.
+     * Przetwarza dane zgromadzone w wewnętrznym buforze (`receiveBuffer`).
+     * Działa w pętli, próbując zinterpretować i przetworzyć jednostki protokołu XMODEM
+     * (pojedyncze bajty sterujące jak EOT, ACK, NAK, CAN lub kompletne bloki danych SOH)
+     * znajdujące się na początku bufora.
+     * Metoda jest `synchronized`, aby zapobiec współbieżnemu dostępowi do bufora i stanu.
      */
     private synchronized void processInternalBuffer() {
-        // System.out.println("[Buffer Proc] Start. Stan: " + currentState + ", Rozmiar: " + receiveBuffer.size());
+        //LOGGER.finest("Przetwarzanie bufora, stan: " + currentState + ", rozmiar bufora: " + receiveBuffer.size());
 
-        boolean processedSomething; // Flaga, aby kontynuować pętlę, jeśli coś zostało przetworzone
-        do {
-            processedSomething = false;
-            if (receiveBuffer.isEmpty()) {
-                // System.out.println("[Buffer Proc] Bufor pusty, koniec przetwarzania.");
-                break; // Nic do przetworzenia
-            }
-
-            // Sprawdzamy pierwszy bajt bez usuwania go jeszcze
+        while (!receiveBuffer.isEmpty()) {
+            // Sprawdź pierwszy bajt w buforze bez usuwania go
             byte firstByte = receiveBuffer.getFirst();
             // System.out.println("[Buffer Proc] Pierwszy bajt: " + String.format("0x%02X", firstByte) + " w stanie " + currentState);
 
-            // ----- LOGIKA ODBIORNIKA -----
-            if (currentState == TransferState.EXPECTING_SOH || currentState == TransferState.RECEIVER_INIT /* Na wszelki wypadek */) {
-                if (firstByte == SOH) {
-                        // Mamy początek pakietu
-                    int requiredLength = 1 /*SOH*/ + 1 /*Blk#*/ + 1 /*~Blk#*/ + BLOCK_SIZE + (useCRC ? 2 : 1) /*CRC/Chk*/;
-                    if (receiveBuffer.size() >= requiredLength) {
-                        // Mamy wystarczająco danych na cały blok SOH
-                        System.out.println("[Buffer Proc] Wykryto SOH, wystarczająca długość (" + receiveBuffer.size() + " >= " + requiredLength + "). Przetwarzam blok.");
-                        cancelTimeoutTask(); // Anuluj timeout oczekiwania na SOH/EOT
-                        byte[] block = extractBytesFromBuffer(requiredLength); // Wyciągnij blok z bufora
-                        processXmodemBlock(block); // Przetwórz blok (to ustawi stan i ewentualny nowy timeout)
-                        processedSomething = true; // Przetworzyliśmy blok, kontynuuj pętlę
-                    } else {
+            switch (currentState) {
+                case EXPECTING_SOH:
+                    // W tym stanie oczekujemy SOH (start bloku) lub EOT (koniec transmisji)
+                    if (firstByte == SOH) {
+                        // Potencjalny początek bloku danych
+                        int requiredBlockLength = 3 + BLOCK_SIZE + (useCRC ? 2 : 1); // SOH, Nr, ~Nr, Dane[128], Cksum/CRC[1/2]
+                        if (receiveBuffer.size() >= requiredBlockLength) {
+                            // Mamy wystarczająco danych na kompletny blok
+                            byte[] block = extractBytesFromBuffer(requiredBlockLength);
+                            if (block.length == requiredBlockLength) {
+                                cancelTimeoutTask(); // Odebraliśmy coś, anuluj timeout
+                                processXmodemBlock(block); // Przetwórz blok
+                                // processXmodemBlock ustawi odpowiedni stan i timeout
+                            } else {
+                                LOGGER.warning("Błąd podczas wyciągania bloku SOH z bufora.");
+                                // Błąd wewnętrzny, może warto anulować?
+                                return; // Zakończ przetwarzanie na razie
+                            }
+                        } else {
+                            // Za mało danych na pełny blok, czekaj na więcej
                         // Wykryto SOH, ale dane są niekompletne, czekamy na resztę
-                         System.out.println("[Buffer Proc] Wykryto SOH, ale za mało danych (" + receiveBuffer.size() + " < " + requiredLength + "). Czekam na więcej.");
-                        break; // Przerwij pętlę, poczekaj na więcej danych
-                    }
-                } else if (firstByte == EOT) {
-                    // Odebrano EOT
-                    System.out.println("[Buffer Proc] Wykryto EOT.");
-                    cancelTimeoutTask(); // Anuluj timeout oczekiwania na SOH/EOT
-                    extractBytesFromBuffer(1); // Usuń EOT z bufora
-                    completeTransfer(); // Zakończ transfer (wyśle ACK, ustawi stan COMPLETED)
-                    processedSomething = true; // Zakończyliśmy, ale coś przetworzyliśmy
-                } else if (firstByte == CAN) {
-                    // Odebrano CAN - przerwanie transferu przez nadawcę
-                    System.out.println("[Buffer Proc] Wykryto CAN. Anulowanie transferu.");
-                    cancelTimeoutTask();
-                    extractBytesFromBuffer(1); // Usuń CAN
-                    // Standardowo Xmodem wymaga dwóch CAN, ale często jeden wystarczy
-                    // Można dodać logikę sprawdzania drugiego CAN, jeśli jest w buforze
-                    abortTransfer(true); // true - zainicjowane zdalnie
-                    processedSomething = true;
-                }
-                 else {
-                    // Nieoczekiwany bajt w stanie oczekiwania na SOH/EOT/CAN
-                    System.out.println("[Buffer Proc] Oczekiwano SOH/EOT/CAN, otrzymano nieznany bajt: " + String.format("0x%02X", firstByte) + ". Odrzucam.");
-                    extractBytesFromBuffer(1); // Usuń nieoczekiwany bajt
-                    processedSomething = true; // Odrzuciliśmy coś, spróbujmy dalej
-                 }
-            }
-            // ----- LOGIKA NADAJNIKA -----
-            else if (currentState == TransferState.SENDER_WAIT_INIT) {
-                if (firstByte == NAK) {
-                    System.out.println("[Buffer Proc] Odebrano NAK (żądanie startu, suma kontrolna).");
-                    cancelTimeoutTask(); // Anuluj timeout oczekiwania na NAK/C
-                    extractBytesFromBuffer(1);
-                    useCRC = false; // Odbiornik wybrał sumę kontrolną
-                    System.out.println("Nadajnik: Rozpoczynam wysyłanie bloku 1 (Suma kontrolna).");
-                    sendRetries = 0; // Zresetuj licznik prób dla wysyłania
-                    sendNextBlock(); // Wyślij pierwszy blok (to ustawi stan SENDING i timeout ACK)
-                    processedSomething = true;
-                } else if (firstByte == CHAR_C) {
-                    System.out.println("[Buffer Proc] Odebrano 'C' (żądanie startu, CRC).");
-                    cancelTimeoutTask();
-                    extractBytesFromBuffer(1);
-                    useCRC = true; // Odbiornik wybrał CRC
-                    System.out.println("Nadajnik: Rozpoczynam wysyłanie bloku 1 (CRC).");
-                    sendRetries = 0;
-                    sendNextBlock();
-                    processedSomething = true;
-                } else if (firstByte == CAN) {
-                     System.out.println("[Buffer Proc] Odebrano CAN podczas oczekiwania na NAK/C.");
-                     cancelTimeoutTask();
-                     extractBytesFromBuffer(1);
-                     abortTransfer(true);
-                     processedSomething = true;
-                } else {
-                    System.out.println("[Buffer Proc] Oczekiwano NAK/'C'/CAN, otrzymano nieznany bajt: " + String.format("0x%02X", firstByte) + ". Odrzucam.");
-                    extractBytesFromBuffer(1); // Usuń śmiecia
-                    processedSomething = true;
-                }
-            } else if (currentState == TransferState.WAITING_FOR_ACK) {
-                if (firstByte == ACK) {
-                    System.out.println("[Buffer Proc] Odebrano ACK dla bloku " + (currentBlockIndex + 1) + ".");
-                    cancelTimeoutTask(); // Anuluj timeout oczekiwania na ACK
-                    extractBytesFromBuffer(1);
-                    sendRetries = 0; // Zresetuj licznik prób dla tego bloku
-                    currentBlockIndex++; // Przejdź do następnego bloku (indeks 0-based)
-                    // Sprawdź, czy wysłaliśmy już wszystkie dane
-                    int dataOffset = currentBlockIndex * BLOCK_SIZE;
-                    if (dataOffset >= fileData.length) {
-                        // Wszystkie bloki wysłane, wyślij EOT
-                        System.out.println("Nadajnik: Wszystkie dane wysłane. Wysyłam EOT.");
-                        sendEOT(); // To ustawi stan SENDING_EOT i timeout EOT_ACK
+                            //LOGGER.finest("Oczekuje na SOH, za mało danych w buforze (" + receiveBuffer.size() + "/" + requiredBlockLength + ")");
+                            return; // Zakończ pętlę, poczekaj na więcej danych
+                        }
+                    } else if (firstByte == EOT) {
+                        // Koniec transmisji
+                        byte[] eot = extractBytesFromBuffer(1);
+                        if (eot.length == 1) {
+                            cancelTimeoutTask(); // Odebraliśmy EOT, anuluj timeout
+                            LOGGER.info("[Odbiornik] Odebrano EOT.");
+                            completeTransfer(); // Zakończ transfer
+                        } else {
+                            LOGGER.warning("Błąd podczas wyciągania EOT z bufora.");
+                            return; // Zakończ przetwarzanie
+                        }
+                    } else if (firstByte == CAN) {
+                        // Anulowanie transmisji przez drugą stronę
+                        byte[] can = extractBytesFromBuffer(1);
+                        if (can.length == 1) {
+                            cancelTimeoutTask();
+                            LOGGER.warning("[Odbiornik] Odebrano CAN. Anulowanie transferu.");
+                            abortTransfer(true); // Anuluj transfer (zdalnie zainicjowany)
+                        } else {
+                             LOGGER.warning("Błąd podczas wyciągania CAN z bufora.");
+                             return;
+                        }
                     } else {
-                        // Wyślij kolejny blok
-                        // System.out.println("Nadajnik: Wysyłam kolejny blok: " + (currentBlockIndex + 1));
-                        sendNextBlock(); // To ustawi stan SENDING i timeout ACK
+                        // Nieoczekiwany bajt w tym stanie
+                        byte unexpectedByte = extractBytesFromBuffer(1)[0];
+                        LOGGER.warning("[Odbiornik] W stanie " + currentState + " odebrano nieoczekiwany bajt: " + String.format("0x%02X", unexpectedByte) + ". Ignorowanie.");
+                        // Ignorujemy nieoczekiwane bajty, czekając na SOH lub EOT
+                        // Można by dodać licznik błędów i anulować po przekroczeniu limitu
                     }
-                    processedSomething = true;
-                } else if (firstByte == NAK) {
-                    System.out.println("[Buffer Proc] Odebrano NAK dla bloku " + (currentBlockIndex + 1) + ". Ponawiam wysłanie.");
-                    cancelTimeoutTask();
-                    extractBytesFromBuffer(1);
-                    handleSendRetry(); // Ponów wysłanie bieżącego bloku (to ustawi stan SENDING i timeout ACK)
-                    processedSomething = true;
-                } else if (firstByte == CAN) {
-                     System.out.println("[Buffer Proc] Odebrano CAN podczas oczekiwania na ACK/NAK.");
-                     cancelTimeoutTask();
-                     extractBytesFromBuffer(1);
-                     abortTransfer(true);
-                     processedSomething = true;
-                } else {
-                     System.out.println("[Buffer Proc] Oczekiwano ACK/NAK/CAN, otrzymano nieznany bajt: " + String.format("0x%02X", firstByte) + ". Ignoruję i czekam na timeout lub poprawną odpowiedź.");
-                     // Nie usuwamy bajtu - może to być np. SOH od odbiornika w wyniku błędu
-                     // Polegamy na timeoutcie ACK, który spowoduje retransmisję.
-                     break; // Przerwij pętlę i czekaj
-                }
-            } else if (currentState == TransferState.WAITING_FOR_EOT_ACK) {
-                if (firstByte == ACK) {
-                    System.out.println("[Buffer Proc] Odebrano ACK dla EOT. Transfer zakończony pomyślnie.");
-                    cancelTimeoutTask(); // Anuluj timeout EOT ACK
-                    extractBytesFromBuffer(1);
-                    currentState = TransferState.COMPLETED; // Transfer zakończony sukcesem!
-                    closeResources(); // Zamknij plik wejściowy
-                    processedSomething = true;
-                } else if (firstByte == CAN) {
-                     System.out.println("[Buffer Proc] Odebrano CAN podczas oczekiwania na EOT ACK.");
-                     cancelTimeoutTask();
-                     extractBytesFromBuffer(1);
-                     abortTransfer(true);
-                     processedSomething = true;
-                }
-                         // Nie ma potrzeby więcej nic robić, wątek główny wykryje zmianę stanu
-                else {
-                    System.out.println("[Buffer Proc] Oczekiwano ACK dla EOT lub CAN, otrzymano: " + String.format("0x%02X", firstByte) + ". Ignoruję.");
+                    break; // Koniec obsługi stanu EXPECTING_SOH
+
+                case SENDER_WAIT_INIT:
+                case WAITING_FOR_ACK:
+                case WAITING_FOR_EOT_ACK:
+                    // Stany nadajnika - odbieranie danych (NAK, 'C', ACK, CAN)
+                    handleSenderReceivedByte(firstByte);
+                    // Jeśli bajt został przetworzony (np. ACK), extractBytesFromBuffer zostanie wywołane w handleSenderReceivedByte
+                    // Jeśli nie został przetworzony lub potrzeba więcej danych, pętla zakończy się lub będzie kontynuowana
+                    break;
+
+                case IDLE:
+                case RECEIVER_INIT:
+                case RECEIVING: // Stan przejściowy, nie powinniśmy tu odbierać nowych danych z bufora
+                case SENDING:   // Stan przejściowy
+                case SENDING_EOT: // Stan przejściowy
+                case COMPLETED:
+                case ABORTED:
+                case ERROR:
+                    // W tych stanach generalnie nie oczekujemy nowych danych z bufora lub transfer jest zakończony/anulowany
+                    byte ignoredByte = extractBytesFromBuffer(1)[0];
+                    LOGGER.finer("Ignorowanie bajtu " + String.format("0x%02X", ignoredByte) + " w stanie " + currentState);
                     // Ignorujemy inne bajty i czekamy na timeout EOT lub poprawny ACK.
-                     break; // Przerwij pętlę i czekaj
-                }
-            }
-            // --- Pozostałe stany ---
-            else if (currentState == TransferState.IDLE || currentState == TransferState.COMPLETED || currentState == TransferState.ABORTED || currentState == TransferState.ERROR || currentState == TransferState.SENDING || currentState == TransferState.SENDING_EOT || currentState == TransferState.RECEIVING) {
-                 // W tych stanach normalnie nie powinniśmy przetwarzać bufora w ten sposób
-                 // (SENDING/SENDING_EOT/RECEIVING to stany przejściowe ustawiane tuż przed akcją)
-                 // Jeśli coś jest w buforze, to prawdopodobnie śmieci lub dane przyszły za późno.
-                 if (!receiveBuffer.isEmpty()) {
-                     System.out.println("[Buffer Proc] Dane w buforze w nieoczekiwanym stanie (" + currentState + "). Czyszczę bajt: " + String.format("0x%02X", firstByte));
-                     extractBytesFromBuffer(1); // Usuń jeden bajt na raz
-                     processedSomething = true; // Coś usunęliśmy
-                 }
+                    break; // Ignoruj dane w tych stanach
+
+                default:
+                    // Nieznany stan - błąd programistyczny
+                    byte unknownStateByte = extractBytesFromBuffer(1)[0];
+                    LOGGER.severe("Nieobsługiwany stan: " + currentState + ". Ignorowanie bajtu: " + String.format("0x%02X", unknownStateByte));
+                    abortTransfer(false); // Anuluj dla bezpieczeństwa
+                    return; // Zakończ przetwarzanie
             }
 
-            // Jeśli nic nie przetworzono w tej iteracji (np. czekamy na więcej danych dla SOH),
-            // a bufor nie jest pusty, wyjdź z pętli, aby uniknąć potencjalnej nieskończonej pętli.
-            if (!processedSomething && !receiveBuffer.isEmpty()) {
-                // System.out.println("[Buffer Proc] Nie przetworzono niczego w tej iteracji, ale bufor nie jest pusty (" + receiveBuffer.size() + " bajtów). Czekam na więcej danych lub timeout.");
-                break;
-            }
-
-        } while (processedSomething && !receiveBuffer.isEmpty()); // Kontynuuj, jeśli coś przetworzono i są jeszcze dane w buforze
-
-        // System.out.println("[Buffer Proc] Koniec. Stan: " + currentState + ", Rozmiar: " + receiveBuffer.size());
+            // Jeśli stan się zmienił lub przetworzono dane, pętla while będzie kontynuowana
+            // Jeśli czekamy na więcej danych (np. niepełny blok SOH), pętla zakończy się przez 'return' w odpowiednim case
+        }
     }
 
+
     /**
-     * NOWOŚĆ: Pomocnicza metoda do wyciągania i usuwania określonej liczby bajtów z początku `receiveBuffer`.
-     * MUSI być wywoływana wewnątrz bloku `synchronized(receiveBuffer)` lub z metody `synchronized`.
+     * Pomocnicza metoda do wyciągania (i usuwania) określonej liczby bajtów z początku bufora `receiveBuffer`.
+     * Ta metoda musi być wywoływana z kontekstu, który zapewnia synchronizację dostępu do `receiveBuffer`
+     * (np. z metody `synchronized` lub w bloku `synchronized(receiveBuffer)`).
+     *
      * @param count Liczba bajtów do wyciągnięcia.
-     * @return Tablica `byte[]` zawierająca wyciągnięte bajty lub pusta tablica w przypadku błędu.
+     * @return Tablica `byte[]` zawierająca wyciągnięte bajty. Zwraca pustą tablicę, jeśli `count` jest niepoprawny
+     *         lub jeśli bufor nie zawiera wystarczającej liczby bajtów (co nie powinno się zdarzyć przy poprawnym użyciu).
      */
     private byte[] extractBytesFromBuffer(int count) {
-        if (count <= 0 || receiveBuffer.size() < count) {
-            System.err.println("[Buffer Extract ERROR] Próba wyciągnięcia " + count + " bajtów z bufora o rozmiarze " + receiveBuffer.size());
-            // Awaryjnie można wyczyścić bufor, ale to może być ryzykowne
-            // receiveBuffer.clear();
-            return new byte[0];
+        if (count <= 0 || count > receiveBuffer.size()) {
+            LOGGER.warning("Próba wyciągnięcia nieprawidłowej liczby bajtów (" + count + ") z bufora (rozmiar: " + receiveBuffer.size() + ")");
+            return new byte[0]; // Zwróć pustą tablicę w przypadku błędu
         }
+
         byte[] extracted = new byte[count];
         // Skuteczniejszy sposób kopiowania i usuwania z ArrayList
         for (int i = 0; i < count; i++) {
-            extracted[i] = receiveBuffer.removeFirst(); // Usuwa element z początku i przesuwa resztę
+            extracted[i] = receiveBuffer.removeFirst(); // Usuń i pobierz pierwszy element
         }
-        // System.out.println("[Buffer Extract] Wyciągnięto " + count + " bajtów. Pozostało: " + receiveBuffer.size());
+        //LOGGER.finest("Wyciągnięto " + count + " bajtów z bufora. Pozostało: " + receiveBuffer.size());
         return extracted;
     }
 
 
     /**
-     * Przetwarza pojedynczy, kompletny blok danych Xmodem (SOH).
-     * Wywoływana przez `processInternalBuffer` gdy w buforze znajdzie się kompletny blok.
-     * @param block Tablica bajtów zawierająca kompletny blok (SOH, Nr, ~Nr, Dane[128], Chk/CRC).
+     * Przetwarza pojedynczy, kompletny blok danych XMODEM (rozpoczynający się od SOH).
+     * Weryfikuje numer bloku, jego dopełnienie, sumę kontrolną/CRC i sekwencję.
+     * Jeśli blok jest poprawny i oczekiwany, zapisuje dane do pliku i wysyła ACK.
+     * Jeśli blok jest duplikatem poprzedniego, wysyła ACK.
+     * W przypadku błędów wysyła NAK lub anuluje transfer.
+     * Wywoływana przez {@link #processInternalBuffer}, gdy zidentyfikuje kompletny blok SOH.
+     *
+     * @param block Tablica bajtów zawierająca kompletny blok XMODEM:
+     *              [SOH, NumerBloku, ~NumerBloku, Dane[128], SumaKontrolna] lub
+     *              [SOH, NumerBloku, ~NumerBloku, Dane[128], CRC-High, CRC-Low]
      */
     private void processXmodemBlock(byte[] block) {
-        currentState = TransferState.RECEIVING; // Ustawiamy stan na czas przetwarzania bloku
+        // Ustawienie stanu na RECEIVING na czas przetwarzania tego bloku
+        changeState(TransferState.RECEIVING);
 
-        // block[0] == SOH (sprawdzone wcześniej)
+        // Zakłada, że block[0] == SOH (weryfikacja w processInternalBuffer)
         byte blockNumberByte = block[1];
         byte blockNumberComplement = block[2];
-        int blockNumber = blockNumberByte & 0xFF; // Konwersja na int bez znaku
+        // Konwersja numeru bloku na int bez znaku (0-255)
+        int blockNumber = blockNumberByte & 0xFF;
 
-        System.out.print("\n[Odbiornik] Przetwarzanie bloku SOH, Nr: " + blockNumber);
+        System.out.print("\n[Odbiornik] Przetwarzanie bloku SOH, Nr: " + blockNumber); // Logowanie konsolowe dla dewelopera
 
-        // 1. Sprawdź poprawność numeru bloku i jego dopełnienia
+        // --- Krok 1: Weryfikacja numeru bloku i jego dopełnienia bitowego ---
         if (!verifyBlockNumber(blockNumberByte, blockNumberComplement)) {
+            // Numer bloku i jego dopełnienie bitowe (one's complement) nie pasują do siebie.
+            LOGGER.warning(". Błąd: Niezgodny numer bloku (" + blockNumber + ") i dopełnienie (" + String.format("%02X", blockNumberComplement) + "). Oczekiwano dopełnienia: " + String.format("%02X", (byte) (255 - blockNumberByte)) + ".");
             System.out.println(". Błąd: Niezgodny numer bloku (" + blockNumber + ") i dopełnienie (" + String.format("%02X", blockNumberComplement) + "). Oczekiwano: " + String.format("%02X", (byte) (255 - blockNumberByte)) + ".");
-            handleBlockError(); // Wyśle NAK, ustawi stan EXPECTING_SOH i timeout
-            return;
+            // Obsługa błędu - wysłanie NAK, ustawienie stanu i timeoutu
+            handleBlockError();
+            return; // Zakończ przetwarzanie tego bloku
         }
 
+        // --- Krok 2: Weryfikacja sekwencji bloków (oczekiwany vs duplikat) ---
+        // Numer oczekiwanego bloku (z zawijaniem modulo 256)
         // 2. Sprawdź, czy to jest oczekiwany numer bloku lub duplikat poprzedniego
-        int expectedNum = expectedBlockNumber % 256; // Upewnij się, że porównujemy w zakresie 0-255
-        int previousNum = (expectedBlockNumber - 1 + 256) % 256; // Poprzedni numer bloku (modulo 256)
+        int expectedNum = expectedBlockNumber % 256;
+        // Numer poprzedniego bloku (na wypadek retransmisji po utraconym ACK)
+        int previousNum = (expectedBlockNumber == 1) ? 0 : (expectedBlockNumber - 1 + 256) % 256; // Poprawka dla pierwszego bloku
 
         if (blockNumber == expectedNum) {
-            // Poprawny, oczekiwany blok
+            // To jest poprawny, oczekiwany blok.
             System.out.print(". Oczekiwany numer (" + expectedNum + "). ");
 
+            // Wyodrębnij dane użytkownika (payload)
             byte[] payload = Arrays.copyOfRange(block, 3, 3 + BLOCK_SIZE);
-            boolean checksumOk;
+            boolean checksumOk; // Flaga poprawności sumy kontrolnej / CRC
 
+            // --- Krok 3: Weryfikacja sumy kontrolnej lub CRC ---
             if (useCRC) {
-                // Weryfikacja CRC-16
+                // Krok 3a: Weryfikacja sumy kontrolnej CRC-16
+                // Odczytaj CRC z dwóch ostatnich bajtów bloku (Big Endian)
                 int receivedCRC = ((block[3 + BLOCK_SIZE] & 0xFF) << 8) | (block[3 + BLOCK_SIZE + 1] & 0xFF);
+                // Oblicz CRC dla otrzymanego payloadu
                 int calculatedCRC = calculateCRC16(payload);
                 System.out.print("CRC Odb: " + String.format("%04X", receivedCRC) + ", Oblicz: " + String.format("%04X", calculatedCRC) + ". ");
+                // Porównaj otrzymane i obliczone CRC
                 checksumOk = (receivedCRC == calculatedCRC);
             } else {
-                // Weryfikacja sumy kontrolnej
+                // Krok 3b: Weryfikacja prostej sumy kontrolnej
+                // Odczytaj sumę kontrolną z ostatniego bajtu bloku
                 byte receivedChecksum = block[3 + BLOCK_SIZE];
+                // Oblicz sumę kontrolną dla otrzymanego payloadu
                 byte calculatedChecksum = calculateChecksum(payload);
                 System.out.print("Suma Odb: " + String.format("%02X", receivedChecksum) + ", Oblicz: " + String.format("%02X", calculatedChecksum) + ". ");
+                // Porównaj otrzymaną i obliczoną sumę
                 checksumOk = (receivedChecksum == calculatedChecksum);
             }
 
+            // --- Krok 4: Przetwarzanie wyniku weryfikacji sumy/CRC ---
             if (checksumOk) {
+                // Suma kontrolna / CRC jest poprawna.
                 System.out.println("Suma kontrolna poprawna. Zapisuję dane.");
+                // Zapisz payload do pliku
                 if (savePayloadToFile(payload)) {
-                    expectedBlockNumber++; // Przejdź do następnego numeru bloku TYLKO po poprawnym zapisie
-                    receiveRetries = 0; // Zresetuj licznik błędów dla tego bloku
-                    sendAck(); // Wyślij ACK
-                    currentState = TransferState.EXPECTING_SOH; // Po ACK czekamy na kolejny SOH lub EOT
-                    resetReceiveTimeout(); // Ustaw timeout na kolejny blok/EOT
+                    // Zapis powiódł się.
+                    // Przygotowanie na odbiór następnego bloku
+                    expectedBlockNumber++;
+                    // Zresetowanie licznika prób odbioru dla nowego bloku
+                    receiveRetries = 0;
+                    // Wysłanie potwierdzenia ACK
+                    sendAck();
+                    // Ustawienie stanu oczekiwania na kolejny pakiet
+                    changeState(TransferState.EXPECTING_SOH);
+                    // Resetowanie timeoutu oczekiwania na pakiet
+                    resetReceiveTimeout();
                 } else {
+                    // Obsługa krytycznego błędu zapisu pliku
+                    LOGGER.severe("Krytyczny błąd zapisu do pliku '" + outputFileName + "'! Anuluję transfer.");
                     // Błąd zapisu pliku - traktujemy jak krytyczny błąd
                     System.err.println("Krytyczny błąd zapisu do pliku! Anuluję transfer.");
+                    // Anuluj transfer z inicjatywy lokalnej
                     abortTransfer(false);
                 }
             } else {
+                // Suma kontrolna / CRC jest niepoprawna.
+                LOGGER.warning("Błąd sumy kontrolnej/CRC dla bloku " + blockNumber);
                 System.out.println("Błąd sumy kontrolnej.");
-                handleBlockError(); // Wyśle NAK, ustawi stan EXPECTING_SOH i timeout
+                // Obsługa błędu sumy kontrolnej - wysłanie NAK
+                handleBlockError();
             }
 
-        } else if (blockNumber == previousNum) {
-            // To jest duplikat poprzedniego bloku (nadawca nie dostał naszego ACK)
+        } else if (blockNumber == previousNum && expectedBlockNumber > 1) {
+            // Otrzymano duplikat poprzedniego bloku (prawdopodobnie utracono ACK). Sprawdzamy expected > 1, aby uniknąć pętli przy bloku 0/255.
+            LOGGER.info(". Duplikat bloku " + blockNumber + " (oczekiwano " + expectedNum + "). Wysyłam ponownie ACK.");
             System.out.println(". Duplikat bloku " + blockNumber + " (oczekiwano " + expectedNum + "). Wysyłam ponownie ACK.");
-            sendAck(); // Wyślij ponownie ACK dla tego (poprzedniego) bloku
-            // Nie inkrementuj expectedBlockNumber, nie zapisuj danych, nie resetuj receiveRetries
-            currentState = TransferState.EXPECTING_SOH; // Nadal czekamy na właściwy blok expectedBlockNumber
-            resetReceiveTimeout(); // Resetuj timeout po wysłaniu ACK
+            // Wysłanie ponownego ACK dla zduplikowanego bloku
+            sendAck();
+            // Ważne: Nie zapisywać danych i nie zmieniać oczekiwanego numeru bloku
+            // Pozostanie w stanie oczekiwania na właściwy blok
+            changeState(TransferState.EXPECTING_SOH);
+            // Resetowanie timeoutu po wysłaniu ACK
+            resetReceiveTimeout();
 
         } else {
+            // Krytyczny błąd sekwencji - otrzymano nieoczekiwany numer bloku
+            LOGGER.severe(". KRYTYCZNY BŁĄD SEKWENCJI! Oczekiwano bloku " + expectedNum + " (lub duplikatu " + previousNum + "), a otrzymano " + blockNumber + ". Anuluję transfer.");
             // Błąd sekwencji bloków - nie jest to ani oczekiwany, ani poprzedni blok. Poważny problem.
             System.err.println(". KRYTYCZNY BŁĄD SEKWENCJI! Oczekiwano bloku " + expectedNum + " lub " + previousNum + ", otrzymano " + blockNumber + ". Anuluję transfer.");
-            abortTransfer(false); // Anuluj transfer
+            // Anulowanie transferu z powodu błędu sekwencji
+            abortTransfer(false);
         }
     }
 
     /**
 
-     * Resetuje timeout oczekiwania na SOH/EOT (odbiornik).
-     * Używa stałej ACK_TIMEOUT_MS, ponieważ po wysłaniu ACK czekamy podobny czas jak nadajnik na ACK.
+     * Resetuje timeout oczekiwania na następny pakiet (SOH lub EOT) od nadajnika.
+     * Używa stałej {@link #ACK_TIMEOUT_MS}, zakładając, że po wysłaniu ACK przez odbiornik,
+     * czas oczekiwania na odpowiedź nadajnika jest podobny do czasu oczekiwania nadajnika na ACK.
+     * Wywoływana po wysłaniu ACK lub NAK.
      */
     private void resetReceiveTimeout() {
-        cancelTimeoutTask(); // Anuluj poprzedni timeout
+        cancelTimeoutTask(); // Anuluj poprzedni timeout, jeśli istnieje
+        // Ustaw nowy timeout oczekiwania na SOH/EOT
         // System.out.println("Resetuję timeout odbiornika (" + ACK_TIMEOUT_MS + "ms) na SOH/EOT.");
         // Używamy krótszego timeoutu, gdy już trwa transmisja
         timeoutTaskHandler = timeoutScheduler.schedule(this::handleReceiveTimeout, ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        //LOGGER.finest("Zresetowano timeout odbiornika (" + ACK_TIMEOUT_MS + "ms)");
     }
 
     /**
-     * Zapisuje dane (payload) do otwartego pliku.
-     * NIE usuwa znaków wypełnienia SUB (0x1A) - to nastąpi na końcu.
-     * @param payload Dane do zapisania (128 bajtów).
-     * @return true jeśli zapis się powiódł, false w przypadku błędu IO.
+     * Zapisuje blok danych (payload) do otwartego pliku wyjściowego.
+     * Tworzy i otwiera strumień pliku przy pierwszym zapisie.
+     * Ta metoda *nie* usuwa znaków wypełnienia SUB (0x1A) z danych;
+     * usuwanie paddingu odbywa się jednorazowo po zakończeniu transferu.
+     *
+     * @param payload Tablica bajtów (128) zawierająca dane do zapisania.
+     * @return {@code true} jeśli zapis się powiódł, {@code false} w przypadku błędu I/O.
      */
     private boolean savePayloadToFile(byte[] payload) {
-        // Sprawdź, czy strumień jest dostępny i nie został zamknięty
-        if (fileOutputStream == null || fileStreamClosed) {
-            System.err.println("Błąd krytyczny: Próba zapisu do pliku, gdy fileOutputStream jest null lub został już zamknięty!");
-            // Jeśli nie jest zamknięty, to znaczy że jest null - błąd inicjalizacji, anuluj
-            if (!fileStreamClosed) {
-                abortTransfer(false);
-            }
-            return false;
-        }
         try {
+            // Otwórz strumień pliku, jeśli jeszcze nie jest otwarty
+        // Sprawdź, czy strumień jest dostępny i nie został zamknięty
+            if (fileOutputStream == null) {
+                LOGGER.info("Otwieranie strumienia do pliku: " + outputFileName);
+                // Sprawdź czy plik istnieje i ew. usuń (opcjonalne, zależy od wymagań)
+                // Files.deleteIfExists(Paths.get(outputFileName));
+                fileOutputStream = new FileOutputStream(outputFileName, false); // false = nadpisz, jeśli istnieje
+                fileStreamClosed = false; // Strumień jest teraz otwarty
+            }
+            // Zapisz dane do strumienia
             fileOutputStream.write(payload);
+            //LOGGER.finest("Zapisano " + payload.length + " bajtów do pliku.");
             // flush() może spowalniać, ale daje pewność zapisu; można rozważyć usunięcie dla wydajności
             // fileOutputStream.flush();
             return true;
         } catch (IOException e) {
-            System.err.println("Błąd zapisu do pliku: " + e.getMessage());
+            LOGGER.log(Level.SEVERE, "Błąd I/O podczas zapisu do pliku: " + outputFileName, e);
+            // W przypadku błędu zapisu, zamknij strumień, jeśli był otwarty
+            closeOutputFileStream();
+            changeState(TransferState.ERROR); // Ustaw stan błędu
             // Błąd zapisu jest krytyczny, ale decyzję o anulowaniu podejmuje processXmodemBlock/handleBlockError
             return false;
         }
@@ -541,156 +559,131 @@ public class Xmodem {
 
 
     /**
-     * Wysyła ACK (potwierdzenie).
+     * Wysyła bajt potwierdzenia ACK (0x06) do nadajnika.
      */
     private void sendAck() {
-        System.out.println("--> Wysyłam ACK");
+        //LOGGER.finest("[Odbiornik] Wysyłanie ACK");
         communicator.sendData(new byte[]{ACK});
-        // Timeout jest resetowany przez metodę wywołującą (np. processXmodemBlock),
+        // Po wysłaniu ACK, zazwyczaj resetujemy timeout oczekiwania na kolejny pakiet (robione w processXmodemBlock)
         // która wie, na co teraz czekamy.
     }
 
     /**
-     * Wysyła NAK (żądanie retransmisji).
+     * Wysyła bajt negatywnego potwierdzenia NAK (0x15) do nadajnika,
+     * sygnalizując błąd i żądając retransmisji ostatniego bloku.
+     * Resetuje również timeout oczekiwania na odpowiedź.
      */
     // Wysyła NAK
     private void sendNak() {
-        System.out.println("--> Wysyłam NAK");
+        LOGGER.info("[Odbiornik] Wysyłanie NAK (próba błędu " + receiveRetries + ")");
         communicator.sendData(new byte[]{NAK});
+        // Po wysłaniu NAK, musimy zresetować timeout oczekiwania na ponowne wysłanie bloku
+        resetReceiveTimeout();
+        // Ustawiamy stan na oczekiwanie SOH
+        changeState(TransferState.EXPECTING_SOH);
         // Timeout jest resetowany przez metodę wywołującą (np. handleBlockError).
     }
 
     /**
-     * Obsługa błędu odbioru bloku (np. zła suma kontrolna, zły numer/dopełnienie).
-     * Wywoływana przez `processXmodemBlock`.
-     * Wysyła NAK i resetuje timeout. Jeśli przekroczono próby, anuluje transfer.
+     * Obsługuje błąd wykryty podczas przetwarzania bloku danych (np. zła suma kontrolna,
+     * nieprawidłowy numer bloku lub jego dopełnienie).
+     * Inkrementuje licznik błędów. Jeśli limit prób nie został przekroczony, wysyła NAK.
+     * W przeciwnym razie anuluje transfer.
+     * Wywoływana przez {@link #processXmodemBlock}.
      */
     private void handleBlockError() {
         receiveRetries++;
-        System.out.println("Błąd odbioru bloku " + expectedBlockNumber + ". Próba: " + receiveRetries + "/" + MAX_RETRIES);
+        LOGGER.warning("Błąd odbioru bloku " + (expectedBlockNumber % 256) + ". Próba " + receiveRetries + "/" + MAX_RETRIES);
         if (receiveRetries >= MAX_RETRIES) {
-            System.err.println("Przekroczono maksymalną liczbę prób odbioru bloku. Anuluję transfer.");
-            abortTransfer(false);
+            LOGGER.severe("Przekroczono maksymalną liczbę (" + MAX_RETRIES + ") prób odbioru bloku. Anulowanie transferu.");
+            abortTransfer(false); // Anuluj transfer lokalnie
         } else {
-            sendNak(); // Wyślij NAK
-            currentState = TransferState.EXPECTING_SOH; // Po NAK nadal oczekujemy na SOH (retransmisję)
-            resetReceiveTimeout(); // Ustaw timeout na retransmisję
+            sendNak(); // Wyślij NAK, żądając retransmisji
         }
     }
 
     /**
-     * Kończy transfer po odebraniu EOT.
-     * Wysyła ostatnie ACK, zamyka plik, usuwa padding i ustawia stan na COMPLETED.
-     * Wywoływana przez `processInternalBuffer`.
+     * Finalizuje proces odbierania pliku po otrzymaniu sygnału EOT (End of Transmission).
+     * Wysyła ostatnie potwierdzenie ACK, zamyka plik wyjściowy, usuwa z niego
+     * ewentualne końcowe znaki wypełnienia (SUB), i ustawia stan na COMPLETED.
+     * Wywoływana przez {@link #processInternalBuffer} po odebraniu EOT.
      */
     private void completeTransfer() {
-        cancelTimeoutTask(); // Anuluj ewentualny timeout oczekiwania na SOH
+        LOGGER.info("Transfer pliku zakończony (odebrano EOT). Wysyłanie końcowego ACK.");
+        sendAck(); // Wyślij ostatnie ACK jako potwierdzenie odbioru EOT
 
-        // Sprawdź stan - powinien być EXPECTING_SOH lub RECEIVING (jeśli EOT przyszło od razu po bloku)
-        if (currentState != TransferState.EXPECTING_SOH && currentState != TransferState.RECEIVING) {
-            System.err.println("[Odbiornik] Ostrzeżenie: Odebrano EOT w niespodziewanym stanie " + currentState + ".");
-            // Mimo wszystko kontynuujemy proces kończenia
-        }
+        // Zamknij strumień pliku, jeśli był otwarty
+        closeOutputFileStream();
 
-        System.out.println("\n[Odbiornik] Odebrano EOT. Kończenie transferu.");
-        sendAck(); // Wyślij ostatnie ACK potwierdzające EOT
-
+        // Usuń końcowe bajty SUB (padding) z pliku, jeśli został utworzony
         // --- Zamykanie pliku i usuwanie paddingu SUB ---
-        if (fileOutputStream != null && !fileStreamClosed) {
-            try {
-                fileOutputStream.close(); // Zamknij strumień teraz, aby upewnić się, że wszystkie dane są zapisane
-                fileStreamClosed = true; // Oznacz jako zamknięty
-                System.out.println("[Odbiornik] Strumień pliku zamknięty.");
+        if (outputFileName != null && !outputFileName.isEmpty()) {
+             try {
+                 removeTrailingSubPadding();
 
-                // Teraz usuń padding SUB z końca pliku
-                removeTrailingSubPadding();
-
-            } catch (IOException e) {
-                System.err.println("Błąd podczas zamykania pliku przed usunięciem paddingu: " + e.getMessage());
-                // Mimo błędu zamykania, próbujemy usunąć padding, ale transfer uznajemy za zakończony z potencjalnymi problemami.
-                // Spróbuj usunąć padding nawet jeśli zamknięcie się nie powiodło (choć to mało prawdopodobne)
-                try {
-                    removeTrailingSubPadding();
-                } catch (IOException suppress) {
-                    System.err.println("Dodatkowy błąd podczas próby usunięcia paddingu po błędzie zamknięcia: " + suppress.getMessage());
-                }
-            } finally {
-                fileOutputStream = null; // Ustaw na null, bo strumień jest (lub powinien być) zamknięty
-            }
-        } else if (fileStreamClosed) {
-            System.out.println("[Odbiornik] Strumień pliku był już zamknięty (np. przez błąd zapisu lub anulowanie) przed odebraniem EOT. Nie usuwam paddingu.");
-        } else {
-            // To nie powinno się zdarzyć, jeśli startReceive poprawnie otworzył plik
-            System.err.println("[Odbiornik] Błąd krytyczny: fileOutputStream był null na etapie kończenia transferu.");
-            currentState = TransferState.ERROR; // Błąd wewnętrzny
-            return; // Zakończ, nie ustawiaj COMPLETED
+             } catch (IOException e) {
+                 LOGGER.log(Level.SEVERE, "Nie udało się usunąć końcowego paddingu z pliku: " + outputFileName, e);
+                 // Mimo błędu usuwania paddingu, transfer uznajemy za zakończony, ale logujemy problem
+             }
         }
 
-        // Ustaw stan COMPLETED tylko jeśli nie ustawiono wcześniej ERROR
-        if (currentState != TransferState.ERROR) {
-            currentState = TransferState.COMPLETED;
-            System.out.println("[Odbiornik] Transfer zakończony pomyślnie.");
-        }
+        LOGGER.info("Transfer zakończony pomyślnie: " + outputFileName);
+        changeState(TransferState.COMPLETED); // Ustaw stan końcowy
+        // Nie ma potrzeby resetować timeoutu, transfer zakończony
     }
 
     /**
-     * NOWA METODA POMOCNICZA: Usuwa końcowe bajty SUB (0x1A) z pliku.
-     * Wywoływana przez completeTransfer PO zamknięciu FileOutputStream.
+     * Usuwa końcowe bajty wypełnienia SUB (0x1A) z zapisanego pliku.
+     * Odczytuje plik od końca, szukając ostatniego bajtu różnego od SUB,
+     * a następnie skraca plik do tej pozycji.
+     * Wywoływana przez {@link #completeTransfer} PO zamknięciu strumienia zapisu.
+     *
+     * @throws IOException Jeśli wystąpi błąd podczas operacji na pliku.
      */
     private void removeTrailingSubPadding() throws IOException {
-        System.out.println("[Odbiornik] Sprawdzanie i usuwanie paddingu SUB z pliku: " + outputFileName);
+        if (fileOutputStream != null || !fileStreamClosed) {
+             LOGGER.warning("Próba usunięcia paddingu przed zamknięciem strumienia pliku!");
+             closeOutputFileStream(); // Upewnij się, że jest zamknięty
+        }
+        if (outputFileName == null || Files.notExists(Paths.get(outputFileName))) {
+             LOGGER.info("Plik wyjściowy nie istnieje lub nie został utworzony, pomijanie usuwania paddingu.");
+             return; // Nie ma pliku, nie ma co usuwać
+        }
+
+        LOGGER.info("Usuwanie końcowego paddingu SUB (0x1A) z pliku: " + outputFileName);
+        long originalSize = Files.size(Paths.get(outputFileName));
+        long newSize = originalSize;
+
         try (RandomAccessFile raf = new RandomAccessFile(outputFileName, "rw")) {
-            long fileSize = raf.length();
-            if (fileSize == 0) {
-                System.out.println("[Odbiornik] Plik jest pusty, brak paddingu do usunięcia.");
-                return; // Plik pusty, nic do roboty
-            }
+            // Jeśli plik jest pusty, nie ma co robić
+             if (originalSize == 0) {
+                 LOGGER.info("Plik jest pusty, brak paddingu do usunięcia.");
+                 return;
+             }
 
-            // XMODEM dodaje padding tylko do ostatniego bloku (128 bajtów)
-            // Musimy sprawdzić bajty od końca, ale maksymalnie 128
-            long startCheckPos = Math.max(0, fileSize - BLOCK_SIZE);
-            raf.seek(startCheckPos); // Ustaw wskaźnik na początek potencjalnego obszaru paddingu
-
-            // Odczytaj potencjalny ostatni blok (lub mniej, jeśli plik jest krótszy)
-            int bytesToCheck = (int) (fileSize - startCheckPos);
-            byte[] lastBytes = new byte[bytesToCheck];
-            int readCount = raf.read(lastBytes);
-
-            if (readCount != bytesToCheck) {
-                // To nie powinno się zdarzyć, jeśli seek/length działają poprawnie
-                throw new IOException("Nie udało się odczytać oczekiwanej liczby bajtów (" + bytesToCheck + ") z końca pliku.");
-            }
-
-            // Znajdź indeks ostatniego bajtu, który NIE jest SUB
-            int lastNonSubIndex = -1;
-            for (int i = readCount - 1; i >= 0; i--) {
-                if (lastBytes[i] != SUB) {
-                    lastNonSubIndex = i;
+            // Przeszukuj od końca pliku
+            for (long pos = originalSize - 1; pos >= 0; pos--) {
+                raf.seek(pos);
+                int b = raf.read();
+                if (b == -1) { // Koniec pliku (nie powinno się zdarzyć w pętli)
                     break;
                 }
-            }
-
-            // Oblicz nowy rozmiar pliku
-            long newLength;
-            if (lastNonSubIndex == -1) {
-                // Wszystkie sprawdzone bajty (cały ostatni blok lub cały plik, jeśli krótszy) to SUB
-                newLength = startCheckPos; // Obetnij do początku sprawdzanego obszaru
-            } else {
-                // Znaleziono bajt niebędący SUB, nowy rozmiar to pozycja tego bajtu + 1
-                newLength = startCheckPos + lastNonSubIndex + 1;
+                if ((byte) b != SUB) {
+                    // Znaleziono pierwszy bajt od końca, który nie jest SUB
+                    newSize = pos + 1;
+                    break;
+                }
+                // Jeśli bajt to SUB, kontynuuj szukanie wstecz
+                newSize = pos; // Aktualizuj potencjalny nowy rozmiar (jeśli cały plik to SUB)
             }
 
             // Jeśli nowy rozmiar jest mniejszy niż obecny, obetnij plik
-            if (newLength < fileSize) {
-                raf.setLength(newLength); // Obetnij plik
-                System.out.println("[Odbiornik] Usunięto padding SUB. Nowy rozmiar pliku: " + newLength + " (usunięto " + (fileSize - newLength) + " bajtów)");
+            if (newSize < originalSize) {
+                raf.setLength(newSize); // Skróć plik do nowego rozmiaru
+                LOGGER.info("Usunięto " + (originalSize - newSize) + " bajtów paddingu. Nowy rozmiar pliku: " + newSize);
             } else {
-                System.out.println("[Odbiornik] Nie znaleziono paddingu SUB na końcu pliku.");
+                LOGGER.info("Nie znaleziono końcowego paddingu SUB do usunięcia.");
             }
-        } catch (FileNotFoundException e) {
-            // Plik mógł zostać usunięty w międzyczasie? Mało prawdopodobne.
-            System.err.println("Błąd krytyczny: Nie można ponownie otworzyć pliku '" + outputFileName + "' do usunięcia paddingu: " + e.getMessage());
-            throw e; // Przekaż wyjątek dalej, aby oznaczyć transfer jako ERROR
         }
         // Inne IOException również są przekazywane dalej
     }
@@ -698,380 +691,536 @@ public class Xmodem {
 
 
     /**
-     * Anuluje transfer. Wysyła CAN (jeśli inicjowane lokalnie),
-     * ustawia stan ABORTED, czyści bufor i zamyka zasoby.
-     * @param remoteInitiated True, jeśli anulowanie zostało zainicjowane przez odebranie CAN.
+     * Anuluje bieżący transfer XMODEM.
+     * W zależności od przyczyny, może wysłać sygnał CAN do drugiej strony.
+     * Zmienia stan na ABORTED, czyści bufor odbiorczy, zamyka plik (jeśli otwarty)
+     * i anuluje ewentualne aktywne zadanie timeoutu.
+     *
+     * @param remoteInitiated {@code true}, jeśli anulowanie zostało zainicjowane przez
+     *                        odebranie sygnału CAN od drugiej strony; {@code false}, jeśli
+     *                        anulowanie jest inicjowane lokalnie (np. przez błąd, timeout).
      */
     void abortTransfer(boolean remoteInitiated) {
-        cancelTimeoutTask(); // Anuluj bieżący timeout
-
         if (currentState == TransferState.ABORTED || currentState == TransferState.COMPLETED || currentState == TransferState.ERROR) {
-            // Już w stanie końcowym, nic nie rób
-            return;
+            return; // Już w stanie końcowym lub błędzie
         }
 
-        System.out.println("\n[Xmodem] Anulowanie transferu... (Zdalnie: " + remoteInitiated + ", Stan: " + currentState + ")");
+        LOGGER.warning("Anulowanie transferu. Inicjowane zdalnie: " + remoteInitiated + ", Stan bieżący: " + currentState);
+        cancelTimeoutTask(); // Anuluj aktywny timeout
 
         if (!remoteInitiated && currentState != TransferState.IDLE) {
+            // Jeśli anulowanie jest lokalne i transfer był w toku, wyślij CAN (dwa razy dla pewności)
+            LOGGER.info("Wysyłanie sygnału CAN.");
             // Wyślij CAN dwukrotnie dla pewności, jeśli my anulujemy
             byte[] cancelSignal = {CAN, CAN};
             communicator.sendData(cancelSignal);
-            System.out.println("[Xmodem] Wysłano sygnał CAN.");
         }
 
-        currentState = TransferState.ABORTED;
-        receiveBuffer.clear(); // Wyczyść bufor odbiorczy
+        changeState(TransferState.ABORTED); // Ustaw stan anulowania
 
-        // Zamknij strumień pliku, jeśli jest otwarty i jeszcze nie zamknięty
+        // Czyszczenie zasobów
+        receiveBuffer.clear(); // Wyczyść bufor odbiorczy
+        closeOutputFileStream(); // Zamknij plik wyjściowy, jeśli był otwarty
+        fileData = null; // Wyczyść dane pliku do wysłania (jeśli dotyczy nadajnika)
+
+        LOGGER.info("Transfer anulowany.");
+    }
+
+    /**
+     * Bezpiecznie zamyka strumień do pliku wyjściowego, jeśli jest otwarty.
+     * Ustawia flagę {@code fileStreamClosed} na true.
+     * Łapie i loguje ewentualne wyjątki IOException.
+     */
+    private void closeOutputFileStream() {
         if (fileOutputStream != null && !fileStreamClosed) {
             try {
+                LOGGER.info("Zamykanie strumienia pliku: " + outputFileName);
+                fileOutputStream.flush(); // Upewnij się, że wszystko zostało zapisane
                 fileOutputStream.close();
-                System.out.println("[Xmodem] Strumień pliku zamknięty podczas anulowania.");
             } catch (IOException e) {
-                System.err.println("Błąd podczas zamykania pliku przy anulowaniu: " + e.getMessage());
+                LOGGER.log(Level.SEVERE, "Błąd podczas zamykania strumienia pliku: " + outputFileName, e);
+                // Mimo błędu zamknięcia, uznajemy strumień za nieaktywny
             } finally {
-                fileOutputStream = null; // Niezależnie od błędu, ustaw na null
-                fileStreamClosed = true; // Oznacz jako zamknięty
+                fileOutputStream = null;
+                fileStreamClosed = true;
             }
-        } else if (fileStreamClosed) {
-            System.out.println("[Xmodem] Strumień pliku był już zamknięty podczas anulowania.");
+        } else {
+             //LOGGER.finest("Strumień pliku był już zamknięty lub nie został otwarty.");
+             fileStreamClosed = true; // Upewnij się, że flaga jest true
         }
-
-        System.out.println("[Xmodem] Transfer anulowany.");
-        // Nie wyłączamy tutaj schedulera, zrobi to Main na końcu
     }
 
 
     /**
-     * Anuluje bieżący timeout task, jeśli istnieje i nie został jeszcze wykonany.
+     * Anuluje bieżące zaplanowane zadanie timeoutu, jeśli istnieje i nie zostało jeszcze wykonane lub anulowane.
      */
     private void cancelTimeoutTask() {
-        if (timeoutTaskHandler != null) {
-            if (!timeoutTaskHandler.isDone()) {
+        if (timeoutTaskHandler != null && !timeoutTaskHandler.isDone()) {
                 // System.out.println("Anulowanie aktywnego timeoutu.");
-                timeoutTaskHandler.cancel(false); // false - nie przerywaj, jeśli już działa
-            }
-            timeoutTaskHandler = null; // Usuń uchwyt
+            timeoutTaskHandler.cancel(false); // false - nie przerywaj, jeśli już działa (co nie powinno mieć miejsca dla timeoutu)
+            //LOGGER.finest("Anulowano poprzedni task timeoutu.");
+            timeoutTaskHandler = null;
             // System.out.println("Anulowano timeout task."); // Opcjonalny log
         }
     }
 
 
+    // =========================================================================
     // --- Metody Nadajnika ---
+    // =========================================================================
 
     /**
-     * Rozpoczyna proces wysyłania pliku.
-     * @param filePath Ścieżka do pliku do wysłania.
-     * @param useCRC Jeśli true, preferuje użycie CRC (czeka na 'C'), inaczej preferuje sumę kontrolną (czeka na NAK).
+     * Rozpoczyna proces wysyłania pliku w trybie XMODEM.
+     * Odczytuje plik do pamięci, ustawia stan oczekiwania na inicjalizację
+     * przez odbiornik (NAK lub 'C') i uruchamia timeout.
+     *
+     * @param filePath Ścieżka do pliku, który ma zostać wysłany.
+     * @param useCRC   Jeśli true, nadajnik będzie oczekiwał na sygnał 'C' i użyje CRC-16.
+     *                 Jeśli false, będzie oczekiwał na NAK i użyje sumy kontrolnej.
      */
     public void startSend(String filePath, boolean useCRC) {
         if (currentState != TransferState.IDLE) {
-            System.err.println("Nie można rozpocząć wysyłania, transfer już w toku lub nie zakończony poprawnie. Stan: " + currentState);
+            LOGGER.warning("Próba rozpoczęcia wysyłania, gdy transfer jest już w toku. Stan: " + currentState);
             return;
         }
 
+        LOGGER.info("Rozpoczynanie wysyłania pliku: " + filePath + " (CRC: " + useCRC + ")");
+        this.useCRC = useCRC;
+        this.currentBlockIndex = 0;
+        this.sendRetries = 0;
+        this.receiveBuffer.clear(); // Wyczyść bufor na wypadek śmieci
+
         // Wczytaj plik do pamięci
         try {
-            File file = new File(filePath);
-            if (!file.exists() || !file.isFile()) {
-                throw new FileNotFoundException("Plik nie istnieje lub nie jest plikiem: " + filePath);
+            fileData = Files.readAllBytes(Paths.get(filePath));
+            if (fileData.length == 0) {
+                LOGGER.warning("Plik '" + filePath + "' jest pusty. Nie ma czego wysyłać.");
+                // Można by wysłać EOT od razu, ale standardowo XMODEM tego nie przewiduje
+                // Zakończmy jako błąd lub anulowanie
+                changeState(TransferState.ERROR); // Lub ABORTED
+                return;
             }
-            if (file.length() == 0) {
-                System.out.println("Ostrzeżenie: Plik '" + filePath + "' jest pusty. Wysyłam tylko EOT.");
-                 // Specyficzna obsługa pustego pliku - od razu wysyłamy EOT po inicjalizacji
-                 fileData = new byte[0]; // Pusta tablica
-            } else {
-                // Wczytaj cały plik do pamięci - UWAGA: Może być problematyczne dla dużych plików!
-                fileData = Files.readAllBytes(Paths.get(filePath));
-                 System.out.println("Plik wczytany do pamięci: " + filePath + " (" + fileData.length + " bajtów)");
-            }
-
-            this.useCRC = useCRC; // Zapamiętaj preferowany tryb
-            this.currentBlockIndex = 0; // Zaczynamy od bloku 0 (wysyłany jako nr 1)
-            this.sendRetries = 0; // Resetuj licznik prób inicjalizacji
-            this.currentState = TransferState.SENDER_WAIT_INIT; // Ustaw stan oczekiwania na NAK/C
-
-            System.out.println("Rozpoczynanie wysyłania. Oczekuję na sygnał startu (NAK lub 'C') od odbiornika...");
-            resetSendInitiationTimeout(); // Ustaw timeout oczekiwania na NAK/C
-
+            LOGGER.info("Wczytano " + fileData.length + " bajtów z pliku.");
         } catch (IOException e) {
-            System.err.println("Błąd podczas odczytu pliku '" + filePath + "': " + e.getMessage());
-            currentState = TransferState.ERROR;
-            fileData = null; // Wyczyść dane pliku
+            LOGGER.log(Level.SEVERE, "Nie można odczytać pliku do wysłania: " + filePath, e);
+            changeState(TransferState.ERROR);
+            return;
         }
+
+        // Ustaw stan oczekiwania na sygnał inicjujący od odbiornika
+        changeState(TransferState.SENDER_WAIT_INIT);
+        // Ustaw timeout oczekiwania na NAK lub 'C'
+        resetSendInitiationTimeout();
+        // Rozpocznij nasłuchiwanie odpowiedzi (przez processInternalBuffer wywoływane z ReceivedDataFromSerial)
     }
 
     /**
-     * Resetuje timeout oczekiwania na NAK/C na początku wysyłania.
+     * Resetuje (lub ustawia po raz pierwszy) timeout oczekiwania na sygnał inicjujący
+     * transfer (NAK lub 'C') od odbiornika.
+     * Wywoływana na początku procesu wysyłania.
      */
     private void resetSendInitiationTimeout() {
-        cancelTimeoutTask(); // Anuluj stary timeout
-        // System.out.println("Resetuję timeout nadajnika (" + INIT_TIMEOUT_MS + "ms) na oczekiwanie NAK/C.");
+        cancelTimeoutTask();
+        LOGGER.fine("Ustawiono timeout oczekiwania na sygnał NAK/'C' (" + INIT_TIMEOUT_MS + "ms)");
         // Używamy tego samego timeoutu co odbiornik na pierwszy blok
         // Dajemy odbiornikowi czas na wysłanie pierwszego NAK/C
         timeoutTaskHandler = timeoutScheduler.schedule(this::handleSendTimeout, INIT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
     }
 
-    /**
-     * Metoda wywoływana przez timeoutScheduler, gdy upłynie czas oczekiwania na NAK/C (start) lub ACK/NAK (po bloku) lub ACK (po EOT).
-     */
+     /**
+      * Obsługuje sytuację timeoutu podczas wysyłania danych.
+      * Wywoływana przez {@link ScheduledExecutorService}, gdy upłynie czas oczekiwania.
+      * W zależności od stanu, ponawia próbę wysłania bloku/EOT lub anuluje transfer,
+      * jeśli przekroczono limit prób.
+      */
     private void handleSendTimeout() {
-        // Upewnij się, że timeout jest nadal aktywny
-        if (timeoutTaskHandler == null || timeoutTaskHandler.isDone()) {
-            return;
-        }
-
-        System.out.println("\n[Timeout Nadajnika]");
-
-        switch (currentState) {
-            case SENDER_WAIT_INIT:
-                System.out.println("Nie odebrano NAK ani 'C' w oczekiwanym czasie.");
-                sendRetries++;
-                if (sendRetries >= MAX_INIT_RETRIES) { // Użyj MAX_INIT_RETRIES do limitu czekania na start
-                    System.err.println("Przekroczono maksymalny czas oczekiwania na rozpoczęcie transferu przez odbiornik. Anuluję.");
-                    abortTransfer(false);
-                } else {
-                    System.out.println("Czekam dalej na NAK/C (próba " + (sendRetries + 1) + "/" + MAX_INIT_RETRIES + ")");
-                    resetSendInitiationTimeout(); // Ustaw nowy timeout
-                }
-                break;
-
-            case WAITING_FOR_ACK:
-                System.out.println("Nie odebrano ACK ani NAK dla bloku " + (currentBlockIndex + 1) + " w oczekiwanym czasie.");
-                handleSendRetry(); // Spróbuj wysłać blok ponownie
-                break;
-
-            case WAITING_FOR_EOT_ACK:
-                System.out.println("Nie odebrano ACK dla EOT w oczekiwanym czasie.");
-                handleEotRetry(); // Spróbuj wysłać EOT ponownie
-                break;
-
-            default:
-                System.err.println("Timeout nadajnika w nieoczekiwanym stanie: " + currentState);
-                // Rozważ przerwanie transferu
-                // abortTransfer(false);
-                break;
+        if (currentState == TransferState.SENDER_WAIT_INIT) {
+            // Timeout oczekiwania na NAK/'C'
+            sendRetries++;
+            LOGGER.warning("Timeout oczekiwania na NAK/'C'. Próba " + sendRetries + "/" + MAX_INIT_RETRIES);
+            if (sendRetries >= MAX_INIT_RETRIES) {
+                LOGGER.severe("Przekroczono limit prób oczekiwania na inicjalizację od odbiornika. Anulowanie transferu.");
+                abortTransfer(false);
+            } else {
+                // Po prostu ustawiamy timeout ponownie, czekając dalej
+                resetSendInitiationTimeout();
+            }
+        } else if (currentState == TransferState.WAITING_FOR_ACK) {
+            // Timeout oczekiwania na ACK/NAK po wysłaniu bloku
+            sendRetries++;
+            LOGGER.warning("Timeout oczekiwania na ACK/NAK dla bloku " + (currentBlockIndex + 1) + ". Próba " + sendRetries + "/" + MAX_RETRIES);
+            if (sendRetries >= MAX_RETRIES) {
+                LOGGER.severe("Przekroczono limit prób wysłania bloku " + (currentBlockIndex + 1) + ". Anulowanie transferu.");
+                abortTransfer(false);
+            } else {
+                // Wyślij blok ponownie
+                sendNextBlock();
+            }
+        } else if (currentState == TransferState.WAITING_FOR_EOT_ACK) {
+            // Timeout oczekiwania na ACK po wysłaniu EOT
+            sendRetries++;
+            LOGGER.warning("Timeout oczekiwania na ACK po EOT. Próba " + sendRetries + "/" + MAX_RETRIES);
+            if (sendRetries >= MAX_RETRIES) {
+                LOGGER.severe("Przekroczono limit prób wysłania EOT/oczekiwania na ACK. Anulowanie transferu.");
+                abortTransfer(false);
+            } else {
+                // Wyślij EOT ponownie
+                sendEndOfTransmission();
+            }
+        } else {
+            LOGGER.warning("Timeout wystąpił w nieoczekiwanym stanie nadajnika: " + currentState);
+            // Możliwy błąd, rozważ anulowanie
+            // abortTransfer(false);
         }
          // Timeouty w innych stanach są ignorowane
     }
 
     /**
-     * Resetuje timeout oczekiwania na ACK/NAK po wysłaniu bloku.
+     * Resetuje (lub ustawia) timeout oczekiwania na odpowiedź ACK lub NAK od odbiornika
+     * po wysłaniu bloku danych.
      */
     private void resetAckTimeout() {
         cancelTimeoutTask();
+        //LOGGER.finest("Ustawiono timeout oczekiwania na ACK/NAK (" + ACK_TIMEOUT_MS + "ms)");
         // System.out.println("Resetuję timeout nadajnika (" + ACK_TIMEOUT_MS + "ms) na oczekiwanie ACK/NAK dla bloku " + (currentBlockIndex + 1));
         timeoutTaskHandler = timeoutScheduler.schedule(this::handleSendTimeout, ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
     }
 
     /**
-     * Resetuje timeout oczekiwania na ACK po wysłaniu EOT.
+     * Resetuje (lub ustawia) timeout oczekiwania na ostateczne potwierdzenie ACK
+     * od odbiornika po wysłaniu sygnału EOT.
      */
     private void resetEotAckTimeout() {
         cancelTimeoutTask();
-        // System.out.println("Resetuję timeout nadajnika (" + EOT_ACK_TIMEOUT_MS + "ms) na oczekiwanie ACK dla EOT.");
+        //LOGGER.finest("Ustawiono timeout oczekiwania na ACK po EOT (" + EOT_ACK_TIMEOUT_MS + "ms)");
         timeoutTaskHandler = timeoutScheduler.schedule(this::handleSendTimeout, EOT_ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
     }
 
     /**
-     * Konstruuje i wysyła następny blok danych.
-     * Ustawia stan na WAITING_FOR_ACK i resetuje timeout ACK.
-     * Wywoływana po otrzymaniu NAK/C (dla pierwszego bloku) lub ACK (dla kolejnych).
+     * Obsługuje pojedynczy bajt odebrany od odbiornika, gdy nadajnik jest w stanie
+     * oczekiwania na odpowiedź (SENDER_WAIT_INIT, WAITING_FOR_ACK, WAITING_FOR_EOT_ACK).
+     * Ta metoda jest wywoływana przez {@link #processInternalBuffer}.
+     *
+     * @param receivedByte Bajt odebrany od odbiornika.
+     */
+    private synchronized void handleSenderReceivedByte(byte receivedByte) {
+        // Usunięcie bajtu z bufora jest konieczne tylko jeśli go przetwarzamy
+        switch (currentState) {
+            case SENDER_WAIT_INIT:
+                // Oczekujemy na NAK (dla sumy kontrolnej) lub 'C' (dla CRC)
+                byte expectedInitiator = useCRC ? CHAR_C : NAK;
+                String expectedInitiatorName = useCRC ? "'C'" : "NAK";
+
+                if (receivedByte == expectedInitiator) {
+                    extractBytesFromBuffer(1); // Usuń bajt z bufora
+                    cancelTimeoutTask(); // Otrzymaliśmy sygnał, anuluj timeout
+                    LOGGER.info("[Nadajnik] Odebrano sygnał inicjujący " + expectedInitiatorName + ". Rozpoczynanie wysyłania bloku 1.");
+                    sendRetries = 0; // Zresetuj licznik prób dla wysyłania bloków
+                    currentBlockIndex = 0; // Upewnij się, że zaczynamy od pierwszego bloku
+                    sendNextBlock(); // Wyślij pierwszy blok
+                } else if (receivedByte == NAK || receivedByte == CHAR_C) {
+                     extractBytesFromBuffer(1); // Usuń bajt z bufora
+                     LOGGER.warning("[Nadajnik] Odebrano nieoczekiwany sygnał inicjujący (" + String.format("0x%02X", receivedByte) + "), oczekiwano " + expectedInitiatorName + ". Ignorowanie.");
+                     // Można by ewentualnie dostosować tryb CRC/checksum, ale prościej jest zignorować
+                     resetSendInitiationTimeout(); // Resetuj timeout i czekaj dalej na właściwy sygnał
+                } else if (receivedByte == CAN) {
+                     extractBytesFromBuffer(1);
+                     cancelTimeoutTask();
+                     LOGGER.warning("[Nadajnik] Odebrano CAN podczas oczekiwania na inicjalizację. Anulowanie transferu.");
+                     abortTransfer(true);
+                } else {
+                     byte[] ignored = extractBytesFromBuffer(1);
+                     LOGGER.finer("[Nadajnik] Ignorowanie nieoczekiwanego bajtu " + String.format("0x%02X", receivedByte) + " w stanie SENDER_WAIT_INIT.");
+                }
+                break;
+
+            case WAITING_FOR_ACK:
+                // Oczekujemy na ACK (potwierdzenie) lub NAK (retransmisja)
+                if (receivedByte == ACK) {
+                    extractBytesFromBuffer(1);
+                    cancelTimeoutTask();
+                    LOGGER.info("[Nadajnik] Odebrano ACK dla bloku " + (currentBlockIndex + 1) + ".");
+                    sendRetries = 0; // Zresetuj licznik prób dla następnego bloku
+                    currentBlockIndex++; // Przejdź do następnego bloku
+                    // Sprawdź, czy są jeszcze bloki do wysłania
+                    if (currentBlockIndex * BLOCK_SIZE >= fileData.length) {
+                        // Wszystkie bloki wysłane, wyślij EOT
+                        sendEndOfTransmission();
+                    } else {
+                        // Wyślij kolejny blok
+                        sendNextBlock();
+                    }
+                } else if (receivedByte == NAK) {
+                    extractBytesFromBuffer(1);
+                    cancelTimeoutTask();
+                    sendRetries++; // Licznik prób dla *tego samego* bloku
+                    LOGGER.warning("[Nadajnik] Odebrano NAK dla bloku " + (currentBlockIndex + 1) + ". Próba retransmisji " + sendRetries + "/" + MAX_RETRIES);
+                    if (sendRetries >= MAX_RETRIES) {
+                        LOGGER.severe("Przekroczono limit retransmisji dla bloku " + (currentBlockIndex + 1) + ". Anulowanie transferu.");
+                        abortTransfer(false);
+                    } else {
+                        // Wyślij ten sam blok ponownie
+                        sendNextBlock();
+                    }
+                } else if (receivedByte == CAN) {
+                    extractBytesFromBuffer(1);
+                    cancelTimeoutTask();
+                    LOGGER.warning("[Nadajnik] Odebrano CAN podczas oczekiwania na ACK/NAK. Anulowanie transferu.");
+                    abortTransfer(true);
+                } else {
+                    byte[] ignored = extractBytesFromBuffer(1);
+                    LOGGER.finer("[Nadajnik] Ignorowanie nieoczekiwanego bajtu " + String.format("0x%02X", receivedByte) + " w stanie WAITING_FOR_ACK.");
+                }
+                break;
+
+            case WAITING_FOR_EOT_ACK:
+                // Oczekujemy na ostatnie ACK po wysłaniu EOT
+                if (receivedByte == ACK) {
+                    extractBytesFromBuffer(1);
+                    cancelTimeoutTask();
+                    LOGGER.info("[Nadajnik] Odebrano końcowe ACK po EOT. Transfer zakończony pomyślnie.");
+                    changeState(TransferState.COMPLETED); // Ustaw stan końcowy
+                } else if (receivedByte == CAN) { // Teoretycznie możliwe, choć mało prawdopodobne
+                     extractBytesFromBuffer(1);
+                     cancelTimeoutTask();
+                     LOGGER.warning("[Nadajnik] Odebrano CAN podczas oczekiwania na końcowe ACK. Anulowanie transferu.");
+                     abortTransfer(true); // Traktuj jako anulowanie przez odbiorcę
+                }
+                 else {
+                    // Odbiornik może np. wysłać NAK jeśli nie zrozumiał EOT, lub inne śmieci
+                    byte[] ignored = extractBytesFromBuffer(1);
+                    LOGGER.warning("[Nadajnik] Odebrano nieoczekiwany bajt " + String.format("0x%02X", receivedByte) + " zamiast ACK po EOT. Ignorowanie.");
+                    // Można by ponowić EOT, ale standardowo czekamy na ACK lub timeout
+                    // Timeout obsłuży ponowne wysłanie EOT (handleSendTimeout)
+                }
+                break;
+
+             default:
+                 // Nie powinniśmy tu trafić, jeśli logika w processInternalBuffer jest poprawna
+                 byte[] ignored = extractBytesFromBuffer(1);
+                 LOGGER.warning("handleSenderReceivedByte wywołane w nieoczekiwanym stanie: " + currentState + ". Ignorowany bajt: " + String.format("0x%02X", receivedByte));
+                 break;
+        }
+    }
+
+    /**
+     * Przygotowuje i wysyła następny blok danych (lub ten sam w przypadku retransmisji).
+     * Ustawia stan na SENDING, a po wysłaniu na WAITING_FOR_ACK i resetuje timeout ACK.
      */
     private void sendNextBlock() {
-        if (fileData == null) {
-             System.err.println("Błąd krytyczny: Próba wysłania bloku, ale dane pliku są null.");
-             abortTransfer(false);
-             return;
-        }
+        changeState(TransferState.SENDING); // Stan przejściowy na czas przygotowania i wysłania
+
+        int blockNumber = (currentBlockIndex + 1) % 256; // Numer bloku (1-255, zawija się)
+        byte blockNumberByte = (byte) blockNumber;
+        byte blockNumberComplement = (byte) ~blockNumberByte; // Dopełnienie bitowe
 
         // Oblicz początek i koniec danych dla bieżącego bloku
-        int dataOffset = currentBlockIndex * BLOCK_SIZE;
-        if (dataOffset >= fileData.length) {
-            // To nie powinno się zdarzyć, jeśli logika sprawdzania końca jest poprawna
-            System.err.println("Błąd: Próba wysłania bloku poza zakresem danych pliku. Wysyłam EOT.");
-            sendEOT();
-            return;
-        }
+        int startIndex = currentBlockIndex * BLOCK_SIZE;
+        int endIndex = Math.min(startIndex + BLOCK_SIZE, fileData.length);
+        int actualDataLength = endIndex - startIndex;
 
-        int length = Math.min(BLOCK_SIZE, fileData.length - dataOffset);
-
-        byte[] payload = new byte[BLOCK_SIZE]; // Zawsze 128 bajtów
+        // Przygotuj payload (128 bajtów)
+        byte[] payload = new byte[BLOCK_SIZE];
+        if (actualDataLength > 0) {
 
         // Skopiuj dane pliku do payload
-        System.arraycopy(fileData, dataOffset, payload, 0, length);
-
-        // Wypełnij resztę payload znakiem SUB (0x1A), jeśli dane są krótsze niż BLOCK_SIZE
-        // Jeśli blok nie jest pełny, wypełnij resztę znakiem SUB (0x1A)
-        if (length < BLOCK_SIZE) {
-            Arrays.fill(payload, length, BLOCK_SIZE, SUB);
-            System.out.println("Wypełniono " + (BLOCK_SIZE - length) + " bajtów znakiem SUB.");
+            System.arraycopy(fileData, startIndex, payload, 0, actualDataLength);
         }
 
-        // Zbuduj pełny blok Xmodem
-        byte blockNumber = (byte) ((currentBlockIndex + 1) % 256); // Numer bloku (1-255, zawijany)
-        byte blockNumberComplement = (byte) (255 - blockNumber);
-        byte[] block;
+        // Wypełnij resztę payloadu znakiem SUB (padding), jeśli dane są krótsze niż BLOCK_SIZE
+        // Jeśli blok nie jest pełny, wypełnij resztę znakiem SUB (0x1A)
+        if (actualDataLength < BLOCK_SIZE) {
+            Arrays.fill(payload, actualDataLength, BLOCK_SIZE, SUB);
+        }
+
+        // Przygotuj cały pakiet XMODEM
+        byte[] xmodemPacket;
 
         // Oblicz i dodaj sumę kontrolną lub CRC
         if (useCRC) {
+            // Tryb CRC-16
             int crc = calculateCRC16(payload);
-            block = new byte[1 + 1 + 1 + BLOCK_SIZE + 2]; // SOH, Blk#, ~Blk#, Payload, CRC_H, CRC_L
-            block[block.length - 2] = (byte) ((crc >> 8) & 0xFF); // CRC High byte
-            block[block.length - 1] = (byte) (crc & 0xFF);       // CRC Low byte
+            byte crcHigh = (byte) (crc >> 8);
+            byte crcLow = (byte) crc;
+            xmodemPacket = new byte[3 + BLOCK_SIZE + 2]; // SOH, Nr, ~Nr, Dane[128], CRC[2]
+            xmodemPacket[xmodemPacket.length - 2] = crcHigh;
+            xmodemPacket[xmodemPacket.length - 1] = crcLow;
+             LOGGER.fine("[Nadajnik] Wysyłanie bloku " + (currentBlockIndex + 1) + " (Nr: " + blockNumber + "), CRC: " + String.format("%04X", crc));
+             System.out.println("[Nadajnik] Wysyłanie bloku " + (currentBlockIndex + 1) + " (Nr: " + blockNumber + "), CRC: " + String.format("%04X", crc));
         } else {
+            // Tryb sumy kontrolnej
             byte checksum = calculateChecksum(payload);
-            block = new byte[1 + 1 + 1 + BLOCK_SIZE + 1]; // SOH, Blk#, ~Blk#, Payload, Chk
-            block[block.length - 1] = checksum;
+            xmodemPacket = new byte[3 + BLOCK_SIZE + 1]; // SOH, Nr, ~Nr, Dane[128], Suma[1]
+            xmodemPacket[xmodemPacket.length - 1] = checksum;
+            LOGGER.fine("[Nadajnik] Wysyłanie bloku " + (currentBlockIndex + 1) + " (Nr: " + blockNumber + "), Suma: " + String.format("%02X", checksum));
+            System.out.println("[Nadajnik] Wysyłanie bloku " + (currentBlockIndex + 1) + " (Nr: " + blockNumber + "), Suma: " + String.format("%02X", checksum));
         }
 
-        block[0] = SOH;
-        block[1] = blockNumber;
-        block[2] = blockNumberComplement;
-        System.arraycopy(payload, 0, block, 3, BLOCK_SIZE);
+        // Uzupełnij nagłówek pakietu
+        xmodemPacket[0] = SOH;
+        xmodemPacket[1] = blockNumberByte;
+        xmodemPacket[2] = blockNumberComplement;
+        // Skopiuj payload do pakietu
+        System.arraycopy(payload, 0, xmodemPacket, 3, BLOCK_SIZE);
 
-        System.out.println("--> Wysyłam blok SOH, Nr: " + (blockNumber & 0xFF) + ", Rozmiar: " + block.length + ", Tryb: " + (useCRC ? "CRC" : "Suma"));
-        currentState = TransferState.SENDING; // Ustaw stan na czas wysyłania
-        communicator.sendData(block);
-        currentState = TransferState.WAITING_FOR_ACK; // Po wysłaniu czekamy na ACK/NAK
-        resetAckTimeout(); // Ustaw timeout na odpowiedź
+        // Wyślij pakiet przez port szeregowy
+        communicator.sendData(xmodemPacket);
+
+        // Zmień stan na oczekiwanie na ACK/NAK i ustaw timeout
+        changeState(TransferState.WAITING_FOR_ACK);
+        resetAckTimeout();
     }
 
     /**
-     * Obsługuje ponowne wysłanie bieżącego bloku (po NAK lub timeout ACK).
-     * Sprawdza limit prób retransmisji.
-     * Wywoływana przez `processInternalBuffer` (po NAK) lub `handleSendTimeout`.
+     * Wysyła sygnał końca transmisji (EOT).
+     * Ustawia stan na SENDING_EOT, a po wysłaniu na WAITING_FOR_EOT_ACK i resetuje timeout EOT ACK.
      */
-    private void handleSendRetry() {
-        sendRetries++;
-        System.out.println("Ponowna próba wysłania bloku " + (currentBlockIndex + 1) + ". Próba: " + sendRetries + "/" + MAX_RETRIES);
-        if (sendRetries >= MAX_RETRIES) {
-            System.err.println("Przekroczono maksymalną liczbę prób wysłania bloku. Anuluję transfer.");
-            abortTransfer(false);
-        } else {
-            // Wyślij ten sam blok ponownie
-            sendNextBlock(); // Wyślij blok ponownie (to ustawi stan SENDING i timeout ACK)
-        }
-    }
-
-    /**
-     * Wysyła znak końca transmisji (EOT).
-     * Ustawia stan na WAITING_FOR_EOT_ACK i resetuje timeout EOT ACK.
-     * Wywoływana po otrzymaniu ACK dla ostatniego bloku.
-     */
-    private void sendEOT() {
-        System.out.println("--> Wysyłam EOT");
-        currentState = TransferState.SENDING_EOT;
+    private void sendEndOfTransmission() {
+        changeState(TransferState.SENDING_EOT); // Stan przejściowy
+        LOGGER.info("[Nadajnik] Wysyłanie EOT.");
+        System.out.println("\n[Nadajnik] Wysyłanie EOT.");
         communicator.sendData(new byte[]{EOT});
+
+        // Zmień stan na oczekiwanie na końcowe ACK i ustaw timeout
         sendRetries = 0; // Zresetuj licznik prób dla EOT
-        currentState = TransferState.WAITING_FOR_EOT_ACK;
-        resetEotAckTimeout(); // Ustaw timeout oczekiwania na ACK dla EOT
-    }
-
-    /**
-     * Obsługuje ponowne wysłanie EOT (po timeout EOT ACK).
-     * Sprawdza limit prób retransmisji EOT.
-     * Wywoływana przez `handleSendTimeout`.
-     */
-    private void handleEotRetry() {
-        sendRetries++;
-        System.out.println("Ponowna próba wysłania EOT. Próba: " + sendRetries + "/" + MAX_RETRIES);
-        if (sendRetries >= MAX_RETRIES) {
-            System.err.println("Przekroczono maksymalną liczbę prób wysłania EOT (brak ACK). Anuluję transfer.");
-            abortTransfer(false);
-        } else {
-            sendEOT(); // Wyślij EOT ponownie (to ustawi stan SENDING_EOT i timeout EOT_ACK)
-        }
+        changeState(TransferState.WAITING_FOR_EOT_ACK);
+        resetEotAckTimeout();
     }
 
 
-    // --- Metody Narzędziowe ---
+    // =========================================================================
+
+    // --- Metody Pomocnicze (Wspólne / Statyczne) ---
+    // =========================================================================
 
     /**
-     * Oblicza 8-bitową sumę kontrolną (algebraiczną) dla podanych danych.
-     * @param data Dane do obliczenia sumy.
-     * @return Obliczona suma kontrolna.
+     * Oblicza prostą 8-bitową sumę kontrolną dla podanego bloku danych.
+     * Suma jest obliczana jako suma wszystkich bajtów modulo 256.
+     *
+     * @param data Tablica bajtów, dla której obliczana jest suma kontrolna.
+     * @return 8-bitowa suma kontrolna.
      */
     private static byte calculateChecksum(byte[] data) {
         byte checksum = 0;
         for (byte b : data) {
-            checksum += b; // Suma algebraiczna, z naturalnym zawijaniem w zakresie bajtu
+            checksum += b; // Sumowanie z automatycznym zawijaniem (modulo 256)
         }
         return checksum;
     }
 
+    // Tablica predefiniowanych wartości dla CRC-16 CCITT (XMODEM)
+    private static final int[] crcTable = {
+            0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50a5, 0x60c6, 0x70e7,
+            0x8108, 0x9129, 0xa14a, 0xb16b, 0xc18c, 0xd1ad, 0xe1ce, 0xf1ef,
+            0x1231, 0x0210, 0x3273, 0x2252, 0x52b5, 0x4294, 0x72f7, 0x62d6,
+            0x9339, 0x8318, 0xb37b, 0xa35a, 0xd3bd, 0xc39c, 0xf3ff, 0xe3de,
+            0x2462, 0x3443, 0x0420, 0x1401, 0x64e6, 0x74c7, 0x44a4, 0x5485,
+            0xa56a, 0xb54b, 0x8528, 0x9509, 0xe5ee, 0xf5cf, 0xc5ac, 0xd58d,
+            0x3653, 0x2672, 0x1611, 0x0630, 0x76d7, 0x66f6, 0x5695, 0x46b4,
+            0xb75b, 0xa77a, 0x9719, 0x8738, 0xf7df, 0xe7fe, 0xd79d, 0xc7bc,
+            0x48c4, 0x58e5, 0x6886, 0x78a7, 0x0840, 0x1861, 0x2802, 0x3823,
+            0xc9cc, 0xd9ed, 0xe98e, 0xf9af, 0x8948, 0x9969, 0xa90a, 0xb92b,
+            0x5af5, 0x4ad4, 0x7ab7, 0x6a96, 0x1a71, 0x0a50, 0x3a33, 0x2a12,
+            0xdbfd, 0xcbdc, 0xfbbf, 0xeb9e, 0x9b79, 0x8b58, 0xbb3b, 0xab1a,
+            0x6ca6, 0x7c87, 0x4ce4, 0x5cc5, 0x2c22, 0x3c03, 0x0c60, 0x1c41,
+            0xedae, 0xfd8f, 0xcdec, 0xddcd, 0xad2a, 0xbd0b, 0x8d68, 0x9d49,
+            0x7e97, 0x6eb6, 0x5ed5, 0x4ef4, 0x3e13, 0x2e32, 0x1e51, 0x0e70,
+            0xff9f, 0xefbe, 0xdfdd, 0xcffc, 0xbf1b, 0xaf3a, 0x9f59, 0x8f78,
+            0x9188, 0x81a9, 0xb1ca, 0xa1eb, 0xd10c, 0xc12d, 0xf14e, 0xe16f,
+            0x1080, 0x00a1, 0x30c2, 0x20e3, 0x5004, 0x4025, 0x7046, 0x6067,
+            0x83b9, 0x9398, 0xa3fb, 0xb3da, 0xc33d, 0xd31c, 0xe37f, 0xf35e,
+            0x02b1, 0x1290, 0x22f3, 0x32d2, 0x4235, 0x5214, 0x6277, 0x7256,
+            0xb5ea, 0xa5cb, 0x95a8, 0x8589, 0xf56e, 0xe54f, 0xd52c, 0xc50d,
+            0x34e2, 0x24c3, 0x14a0, 0x0481, 0x7466, 0x6447, 0x5424, 0x4405,
+            0xa7db, 0xb7fa, 0x8799, 0x97b8, 0xe75f, 0xf77e, 0xc71d, 0xd73c,
+            0x26d3, 0x36f2, 0x0691, 0x16b0, 0x6657, 0x7676, 0x4615, 0x5634,
+            0xd94c, 0xc96d, 0xf90e, 0xe92f, 0x99c8, 0x89e9, 0xb98a, 0xa9ab,
+            0x5844, 0x4865, 0x7806, 0x6827, 0x18c0, 0x08e1, 0x3882, 0x28a3,
+            0xcb7d, 0xdb5c, 0xeb3f, 0xfb1e, 0x8bf9, 0x9bd8, 0xabbb, 0xbb9a,
+            0x4a75, 0x5a54, 0x6a37, 0x7a16, 0x0af1, 0x1ad0, 0x2ab3, 0x3a92,
+            0xfd2e, 0xed0f, 0xdd6c, 0xcd4d, 0xbdaa, 0xad8b, 0x9de8, 0x8dc9,
+            0x7c26, 0x6c07, 0x5c64, 0x4c45, 0x3ca2, 0x2c83, 0x1ce0, 0x0cc1,
+            0xef1f, 0xff3e, 0xcf5d, 0xdf7c, 0xaf9b, 0xbfba, 0x8fd9, 0x9ff8,
+            0x6e17, 0x7e36, 0x4e55, 0x5e74, 0x2e93, 0x3eb2, 0x0ed1, 0x1ef0
+    };
+
     /**
-     * Oblicza 16-bitowe CRC (CRC-16-CCITT Kermit/XMODEM: poly 0x1021, init 0x0000).
-     * @param data Dane do obliczenia CRC.
-     * @return Obliczone 16-bitowe CRC.
+     * Oblicza 16-bitową sumę kontrolną CRC (Cyclic Redundancy Check)
+     * dla podanego bloku danych, używając standardu CRC-16-CCITT
+     * (często używanego w XMODEM, wielomian x^16 + x^12 + x^5 + 1).
+     * Implementacja wykorzystuje tablicę przeglądową dla wydajności.
+     *
+     * @param data Tablica bajtów, dla której obliczane jest CRC.
+     * @return 16-bitowa wartość CRC.
      */
     private static int calculateCRC16(byte[] data) {
-        int crc = 0x0000; // Inicjalizacja dla XMODEM CRC
-        int poly = 0x1021; // Generator wielomianu (CCITT)
-
+        int crc = 0x0000; // Wartość początkowa CRC dla XMODEM
         for (byte b : data) {
-            crc ^= (int) b << 8; // XOR bajtu danych (przesuniętego do starszego bajtu CRC) z bieżącym CRC
-            for (int i = 0; i < 8; i++) {
-                if ((crc & 0x8000) != 0) { // Jeśli najstarszy bit CRC jest ustawiony
-                    crc = (crc << 1) ^ poly; // Przesuń w lewo i XOR z wielomianem
-                } else {
-                    crc <<= 1; // W przeciwnym razie tylko przesuń w lewo
-                }
-            }
+            // XOR starszego bajtu CRC z nowym bajtem danych, użyj wyniku jako indeksu w tabeli
+            // XOR wyniku z tabeli z młodszym bajtem CRC przesuniętym w lewo o 8 bitów
+            crc = (crc << 8) ^ crcTable[((crc >> 8) ^ b) & 0xFF];
+            crc &= 0xFFFF; // Upewnij się, że wynik pozostaje 16-bitowy
         }
-        return crc & 0xFFFF; // Zwróć 16-bitową wartość
+        return crc;
     }
 
     /**
-     * Weryfikuje, czy dopełnienie numeru bloku jest poprawne.
-     * @param blockNumber Numer bloku (0-255).
-     * @param blockNumberComplement Dopełnienie numeru bloku (~blockNumber).
-     * @return true, jeśli dopełnienie jest poprawne, false w przeciwnym razie.
+     * Weryfikuje, czy podany numer bloku i jego dopełnienie bitowe są zgodne.
+     * W protokole XMODEM, drugi bajt po SOH powinien być dopełnieniem bitowym
+     * (one's complement) pierwszego bajtu numeru bloku.
+     *
+     * @param blockNumberByte       Bajt numeru bloku.
+     * @param blockNumberComplement Bajt dopełnienia numeru bloku.
+     * @return {@code true} jeśli dopełnienie jest poprawne, {@code false} w przeciwnym razie.
      */
-    public static boolean verifyBlockNumber(byte blockNumber, byte blockNumberComplement) {
-        // Sprawdza, czy blockNumber + blockNumberComplement daje 0xFF (czyli 255 lub -1 dla bajtów ze znakiem)
-        return (byte) (blockNumber + blockNumberComplement) == (byte) 0xFF;
+    private static boolean verifyBlockNumber(byte blockNumberByte, byte blockNumberComplement) {
+        // Sprawdza, czy (numer + dopełnienie) daje 0xFF (czyli -1 w reprezentacji U2)
+        return (byte) (blockNumberByte + blockNumberComplement) == (byte) 0xFF;
     }
 
     /**
-     * Zamyka otwarte zasoby (strumień pliku) i czyści dane pliku.
-     * Wywoływana przy zakończeniu transferu (COMPLETED, ABORTED, ERROR).
+     * Zmienia wewnętrzny stan transferu.
+     * Loguje zmianę stanu dla celów diagnostycznych.
+     *
+     * @param newState Nowy stan z enum {@link TransferState}.
      */
-    private void closeResources() {
-        // Zamknij plik wyjściowy (odbiornik)
-        if (fileOutputStream != null) {
-            try {
-                fileOutputStream.close();
-                System.out.println("Zamknięto plik wyjściowy: " + outputFileName);
-            } catch (IOException e) {
-                System.err.println("Błąd podczas zamykania pliku wyjściowego: " + e.getMessage());
-            }
-            fileOutputStream = null;
-        }
-        // Wyczyść dane pliku (nadajnik)
-        if (fileData != null) {
+    private void changeState(TransferState newState) {
+        if (currentState != newState) {
+            LOGGER.fine("Zmiana stanu: " + currentState + " -> " + newState);
              // System.out.println("Czyszczenie danych pliku z pamięci.");
-             fileData = null;
+            currentState = newState;
         }
     }
 
+    // --- Główna metoda (przykład użycia, może być w innej klasie) ---
+    public static void main(String[] args) {
+        // Tutaj można dodać przykładowy kod inicjujący SerialCommunicator
+        // i uruchamiający transfer Xmodem jako nadajnik lub odbiornik.
+        // Np.:
+        // SerialCommunicator communicator = new SerialCommunicator("COM3", 9600); // Przykładowa inicjalizacja
+        // Xmodem xmodem = new Xmodem(communicator);
+        //
+        // // Odbiór:
+        // xmodem.setOutputFileName("otrzymany_plik.txt");
+        // xmodem.startReceive(true); // Odbiór z CRC
+        //
+        // // lub Wysyłanie:
+        // xmodem.startSend("plik_do_wyslania.txt", true); // Wysyłanie z CRC
+
+        // W rzeczywistej aplikacji potrzebna byłaby pętla lub mechanizm
+        // do przekazywania danych z communicator.readBytes() do xmodem.ReceivedDataFromSerial()
+        // oraz obsługa stanów (np. sprawdzanie getCurrentState() do wyświetlania postępu lub zakończenia).
+        System.out.println("Klasa Xmodem gotowa. Użyj metody startSend() lub startReceive() aby rozpocząć transfer.");
+    }
+
+
     /**
-     * Metoda do zamknięcia wątku schedulera przy zamykaniu aplikacji.
-     * Ważne, aby zapobiec zawieszeniu aplikacji.
+     * Wyłącza executor obsługujący zadania timeoutów.
+     * Powinno być wywołane przy zamykaniu aplikacji,
+     * aby zapobiec wyciekom wątków.
+     * Ta metoda nie przerywa aktywnych timeoutów.
      */
     public void shutdownScheduler() {
-        System.out.println("Zamykanie wątku obsługi timeoutów Xmodem...");
-        timeoutScheduler.shutdownNow(); // Natychmiast zatrzymaj oczekujące zadania
-        try {
-            // Poczekaj chwilę na zakończenie wątku
-            if (!timeoutScheduler.awaitTermination(1, TimeUnit.SECONDS)) {
-                System.err.println("Wątek timeoutów nie zakończył się w oczekiwanym czasie.");
-            } else {
-                 System.out.println("Wątek timeoutów zakończony.");
-            }
-        } catch (InterruptedException e) {
-            System.err.println("Oczekiwanie na zamknięcie wątku timeoutów przerwane.");
-            Thread.currentThread().interrupt();
-        }
+        timeoutScheduler.shutdown(); // Zatrzymuje executor, pozwalając dokończyć aktywne zadania
     }
 }
